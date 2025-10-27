@@ -1,142 +1,151 @@
-# TinyNiteSTR — Tiny GPT-2 Style Trainer (EN/日本語)
+# TinyNiteSTR — Tiny GPT/HyenaLM Trainer (EN/日本語)
 
-A lightweight, hackable training and generation playground for a tiny GPT‑2–style model with optional LoRA adapters. Includes simple BPE tokenizer training, dataset preprocessing to memory‑mapped arrays, checkpointing, and text generation utilities.
+A lightweight, hackable training and generation playground featuring a tiny GPT‑2–style Transformer and a Hyena‑style language model, optional LoRA adapters, simple BPE tokenizer training, memory‑mapped datasets, checkpointing, and text generation.
 
 ---
 
 ## English
 
 ### Features
-- Tiny GPT‑2–style model with attention layers (`model.py`)
-- LoRA support for efficient finetuning (`lora.py`)
-- BPE tokenizer training and use (`tokenizer.py`)
-- Data preprocessing to memmaps for fast training (`data.py`)
-- Checkpoint save/load and best/latest tracking (`checkpoint.py`)
+- TinyGPT2 (Transformer) model (`model.py`)
+- HyenaLM (depthwise causal conv + MLP) (`Tynigptkarahyena.py`) — GPU‑only trainer in `mainh.py`
+- LoRA for efficient finetuning on linear layers (`lora.py`)
+- Byte‑BPE tokenizer training and use (`tokenizer.py`)
+- Fast data path via memmaps (`data.py` + `data_fast.py`)
+- Checkpoint save/load + best/latest tracking (`checkpoint.py`)
 
-### Quickstart
-1) Environment
+### Requirements
+- Windows 11, Python 3.12+ (3.12 recommended for GPU; 3.13 is CPU‑only for PyTorch as of now)
+- For GPU training: NVIDIA GPU + recent driver (CUDA 12.x compatible)
+
+### Setup
 ```powershell
 python -m venv .venv
 . .venv\Scripts\Activate.ps1
-pip install -r requirements.txt
-pip install -r requirements-dev.txt  # optional
+pip install -r requirements.txt  # base deps (torch installed separately)
+pip install -r requirements-dev.txt  # optional tools
 ```
 
-2) Tokenizer (if needed)
+Install PyTorch (choose one):
+- GPU (CUDA 12.1, Python 3.12):
+```powershell
+pip install --index-url https://download.pytorch.org/whl/cu121 torch
+```
+- CPU only:
+```powershell
+pip install torch
+```
+
+Optional helper script for GPU setup (Python 3.12 required):
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts\setup_cuda121.ps1 -Py312Path "C:\\Python312\\python.exe"
+```
+
+### Tokenizer
 ```powershell
 python tokenizer.py  # writes tokenizer.json
 ```
 
-3) Prepare data and train
+### Train
+Edit `config.py` (paths, hyperparameters), especially `CORPUS` and `WINDOW`.
 ```powershell
-# Edit config in config.py (paths, hyperparameters)
-python main.py  # or python main2.py
-```
-Checkpoints are created under `checkpoints*/` with best/latest artifacts.
+# TinyGPT2 (CPU/GPU)
+python main.py
 
-4) Generate text
+# HyenaLM (GPU‑only)
+python mainh.py
+```
+Checkpoints are written to `checkpoints/` with rotating latest and best.
+
+### Generate
 ```powershell
-python generate.py  # uses latest/best checkpoint; adjust paths if needed
-```
-
-### Quick Example
-```python
-import torch
-from model import TinyGPT2
-from tokenizer import ByteBPETokenizer
-from checkpoint import try_resume
-from config import VOCAB_SIZE
-from generate import generate_text
-
-device = "cuda" if torch.cuda.is_available() else "cpu"
-tok = ByteBPETokenizer("tokenizer.json")
-model = TinyGPT2(vocab_size=VOCAB_SIZE).to(device).eval()
-try_resume(model, opt=None, scaler=None)  # load latest checkpoint if present
-
-out = generate_text(
-    model, tok, seed_text="Hello, tiny model!", max_new_tokens=80,
-    temperature=0.8, top_p=0.9,
-)
-print(out)
+python generate.py  # uses latest/best checkpoint; adjust paths in script or config.py
 ```
 
 ### Project Structure
-- `model.py` — Tiny GPT‑2 model
-- `optimizer.py` — custom optimizers (e.g., Lion)
-- `data.py` — corpus preprocessing and `Dataset`
-- `tokenizer.py` — ByteBPE training and encode/decode
+- `model.py` — TinyGPT2 (Transformer)
+- `Tynigptkarahyena.py` — HyenaLM (causal depthwise conv + MLP)
+- `optimizer.py` — optimizers (e.g., Lion)
+- `data.py`, `data_fast.py` — preprocessing, memmap datasets, collate
+- `tokenizer.py` — Byte‑BPE training + encode/decode
 - `lora.py` — LoRA modules and mapping helpers
 - `checkpoint.py` — save/resume utilities
-- `main.py`/`main2.py` — training entry points
+- `main.py`, `main2.py`, `mainh.py` — training entry points (HyenaLM is GPU‑only)
 - `generate.py` — text generation
-- `checkpoints*/` — saved weights
-- `old/` — legacy experiments
+- `checkpoints*/` — saved weights; `tokenizer.json` — tokenizer
 
-### Tips
-- Configure everything in `config.py` (run IDs, dirs, hyperparams).
-- For CUDA-specific Torch builds, follow PyTorch install docs and pin `torch` accordingly.
+### Notes
+- Hyena trainer (`mainh.py`) requires CUDA; it will raise if no GPU is available. It also sets `PYTORCH_CUDA_ALLOC_CONF=max_split_size_mb:128,expandable_segments:True` to reduce fragmentation.
+- LoRA applies to linear layers. Convolution layers in Hyena remain unaffected, which is fine.
+- If you encounter CUDA OOM, reduce `BATCH_SIZE` and/or `WINDOW`, enable gradient checkpointing (already enabled by default), and increase `ACCUM_STEPS` to maintain effective batch size.
 
 ---
 
 ## 日本語
 
-### 概要
-小さな GPT‑2 系モデルを手軽に学習・生成できる実験用リポジトリです。LoRA による軽量微調整、BPE トークナイザ学習、メモリマップ化したデータ前処理、チェックポイント管理、テキスト生成を備えています。
+### 特長
+- TinyGPT2（Transformer）: `model.py`
+- HyenaLM（因果 depthwise 畳み込み + MLP）: `Tynigptkarahyena.py`（`mainh.py` は GPU 専用）
+- LoRA による軽量微調整: `lora.py`
+- Byte‑BPE トークナイザの学習と利用: `tokenizer.py`
+- メモリマップによる高速データパス: `data.py` / `data_fast.py`
+- チェックポイント保存/復元（最新/ベスト）: `checkpoint.py`
 
-### はじめ方
-1) 環境構築
+### 必要環境
+- Windows 11, Python 3.12 以上（GPU 利用は 3.12 推奨。3.13 は現状 CPU のみ）
+- GPU 学習には NVIDIA GPU と最新ドライバ（CUDA 12.x 互換）が必要
+
+### セットアップ
 ```powershell
 python -m venv .venv
 . .venv\Scripts\Activate.ps1
-pip install -r requirements.txt
+pip install -r requirements.txt  # ベース依存（torch は別途）
 pip install -r requirements-dev.txt  # 任意
 ```
 
-2) トークナイザ（必要な場合）
+PyTorch のインストール（いずれか）
+- GPU（CUDA 12.1 / Python 3.12）
 ```powershell
-python tokenizer.py  # tokenizer.json を出力
+pip install --index-url https://download.pytorch.org/whl/cu121 torch
+```
+- CPU のみ
+```powershell
+pip install torch
 ```
 
-3) 前処理と学習
+スクリプトで GPU 環境を準備（Python 3.12 必須）
 ```powershell
-# config.py を編集（パスやハイパーパラメータ）
-python main.py  # もしくは python main2.py
-```
-チェックポイントは `checkpoints*/` に best/latest として保存されます。
-
-4) 生成
-```powershell
-python generate.py  # 最新/ベストのチェックポイントを使用（必要に応じてパス調整）
+powershell -ExecutionPolicy Bypass -File scripts\setup_cuda121.ps1 -Py312Path "C:\\Python312\\python.exe"
 ```
 
-### 簡単な例
-```python
-import torch
-from model import TinyGPT2
-from tokenizer import ByteBPETokenizer
-from checkpoint import try_resume
-from config import VOCAB_SIZE
-from generate import generate_text
+### トークナイザ
+```powershell
+python tokenizer.py  # tokenizer.json を生成
+```
 
-device = "cuda" if torch.cuda.is_available() else "cpu"
-tok = ByteBPETokenizer("tokenizer.json")
-model = TinyGPT2(vocab_size=VOCAB_SIZE).to(device).eval()
-try_resume(model, opt=None, scaler=None)  # 可能なら最新チェックポイントを読込
+### 学習
+`config.py`（特に `CORPUS`, `WINDOW`）を調整してから実行します。
+```powershell
+# TinyGPT2（CPU/GPU）
+python main.py
 
-out = generate_text(
-    model, tok, seed_text="こんにちは、ちいさなモデル！", max_new_tokens=80,
-    temperature=0.8, top_p=0.9,
-)
-print(out)
+# HyenaLM（GPU 専用）
+python mainh.py
+```
+
+### 生成
+```powershell
+python generate.py  # 最新/ベストのチェックポイントを使用（必要ならパス調整）
 ```
 
 ### 構成
-- `model.py`（モデル）/ `lora.py`（LoRA）
-- `data.py`（前処理・Dataset）/ `tokenizer.py`（BPE 学習）
-- `checkpoint.py`（保存/復元）/ `optimizer.py`
-- `main.py`・`main2.py`（学習）/ `generate.py`（生成）
-- `checkpoints*/`（学習結果）/ `old/`（過去の実験）
+- `model.py` / `Tynigptkarahyena.py`（Hyena） / `lora.py`
+- `data.py` / `data_fast.py`（前処理・メモリマップ Dataset）
+- `checkpoint.py` / `optimizer.py`
+- `main.py` / `main2.py` / `mainh.py`（Hyena は GPU 専用） / `generate.py`
+- `checkpoints*/`（保存先）/ `tokenizer.json`（トークナイザ）
 
 ### メモ
-- 主要設定は `config.py` で管理します。
-- CUDA 環境では PyTorch の公式手順に従い `torch` のビルドを調整してください。
+- `mainh.py` は CUDA 前提です（GPU 未検出時はエラー）。`PYTORCH_CUDA_ALLOC_CONF` を自動設定して断片化を軽減します。
+- CUDA OOM の場合は `BATCH_SIZE`/`WINDOW` を下げ、`ACCUM_STEPS` を増やしてください。
+

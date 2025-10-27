@@ -96,6 +96,10 @@ class HyenaLM(nn.Module):
         block_size: maximum sequence length (context length)
         dropout: dropout probability (default 0.0)
         kernel_size: kernel size for depthwise causal conv
+
+    Notes:
+        - forward(..., last_only=True) のときは [B,V] を返す（省メモリ）。
+        - last_only=False は従来通り [B,T,V] を返す（generate.py 互換）。
     """
 
     def __init__(
@@ -113,7 +117,7 @@ class HyenaLM(nn.Module):
         self.wpe = nn.Embedding(block_size, d_model)
         self.drop = nn.Dropout(dropout)
 
-        # Choose conservative chunk sizes to reduce peak memory in MLPs
+        # Keep MLP chunking conservative to reduce peak memory
         mlp_t_chunk = max(1, block_size // 2) if block_size >= 32 else 0
 
         # Stagger a couple of dilations to increase receptive field
@@ -139,16 +143,40 @@ class HyenaLM(nn.Module):
         # Optional per-block activation checkpointing (set externally)
         self.checkpoint_blocks: bool = True
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, last_only: bool = False) -> torch.Tensor:
+        """Forward pass.
+
+        Args:
+            x: Long tensor of shape [B, T]
+            last_only: If True, return logits for the last position only -> [B, V].
+                       If False, return full sequence logits -> [B, T, V].
+
+        Returns:
+            Tensor of shape [B, V] when last_only, else [B, T, V].
+        """
         B, T = x.size()
+        # positions
         pos = self._pos_ids[:T].to(x.device)
-        h = self.drop(self.wte(x) + self.wpe(pos)[None, :, :])
+
+        # embeddings
+        h = self.wte(x) + self.wpe(pos)[None, :, :]
+        h = self.drop(h)
+
+        # blocks (optionally checkpointed)
         if self.checkpoint_blocks and self.training:
             for blk in self.blocks:
                 h = cp.checkpoint(blk, h)
         else:
             for blk in self.blocks:
                 h = blk(h)
-        h = self.ln_f(h)
-        return self.lm_head(h)
 
+        h = self.ln_f(h)
+
+        if last_only:
+            # 超重要：ここで [B,T,V] を作らず、最後だけ射出
+            h_last = h[:, -1, :]             # [B, D]
+            logits_last = self.lm_head(h_last)  # [B, V]
+            return logits_last
+
+        # 互換モード：従来通り全時刻を出す
+        return self.lm_head(h)  # [B, T, V]
