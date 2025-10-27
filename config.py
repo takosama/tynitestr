@@ -14,7 +14,7 @@ MODEL_SIZE = "small"
 VOCAB_SIZE = 30000
 WINDOW = 24
 CSV_TEXT_COL, CSV_SEP = "text", ","
-BATCH_SIZE, EPOCHS, LR = 1500, 8, 1e-4
+BATCH_SIZE, EPOCHS, LR = 2048, 8, 1e-4
 BETAS, WEIGHT_DECAY = (0.9, 0.99), 1e-2
 ACCUM_STEPS = 16
 # DataLoader workers（Windowsは0が安定）
