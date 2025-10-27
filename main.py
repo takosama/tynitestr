@@ -1,19 +1,16 @@
 """
-main2.py — Windows-safe trainer with fast DataLoader.
+Windows-friendly trainer using CPU DataLoader and DataParallel (DP).
 
-Changes vs original:
-- Wraps entrypoint in `if __name__ == "__main__":` to satisfy Windows spawn.
-- Uses FastMemmapNexTokDataset + fast_collate_long.
-- Sets DataLoader shuffle=False (dataset already samples randomly).
+- CPU DataLoader (optional pinned memory) + GPU model
+- Automatic DataParallel on multi-GPU
+- Last-token-only loss for lower memory, AMP on CUDA
 """
+
 from hashlib import sha256
 import math
 from pathlib import Path
 from typing import Optional
 import os
-
-# Force CPU-only execution by hiding CUDA devices from PyTorch
-os.environ["CUDA_VISIBLE_DEVICES"] = ""
 
 import numpy as np
 import torch
@@ -30,6 +27,8 @@ from config import (
     CSV_TEXT_COL,
     EPOCHS,
     FORCE_RETRAIN_TOKENIZER,
+    PIN_MEMORY,
+    GRAD_CHECKPOINT,
     LORA_ALPHA,
     LORA_DROPOUT,
     LORA_R,
@@ -66,11 +65,22 @@ def _file_sha256(p: Path) -> str:
         return "na"
 
 
-def seed_worker(_wid: int):
-    import os as _os
-    import numpy as _np
+def _ce_last_light(
+    logits_last: torch.Tensor, targets_last: torch.Tensor, label_smoothing: float = 0.0
+) -> torch.Tensor:
+    """Memory-friendly CE on the final time step only."""
+    lse = torch.logsumexp(logits_last, dim=-1)
+    z_t = logits_last.gather(1, targets_last.unsqueeze(1)).squeeze(1)
+    if label_smoothing and label_smoothing > 0.0:
+        mean_z = logits_last.mean(dim=-1)
+        nll = lse - ((1.0 - label_smoothing) * z_t + label_smoothing * mean_z)
+    else:
+        nll = lse - z_t
+    return nll.mean()
 
-    # Worker seeding (CPU-only)
+
+def seed_worker(_wid: int):
+    import numpy as _np
     s = torch.initial_seed() % (2**32)
     _np.random.seed(s)
 
@@ -82,37 +92,31 @@ def _make_dataloader() -> DataLoader:
     if NUM_WORKERS and NUM_WORKERS > 0:
         extra.update(dict(persistent_workers=True, prefetch_factor=2))
 
-    # Use DistributedSampler under DDP
-    sampler = None
-    if False and dist.is_available() and dist.is_initialized():
-        sampler = DistributedSampler(ds, shuffle=True)
-
     return DataLoader(
         ds,
         batch_size=BATCH_SIZE,
-        shuffle=(sampler is None),  # samplerがあるときはshuffle不可
-        sampler=sampler,
-        pin_memory=False,
+        shuffle=False,
+        pin_memory=bool(PIN_MEMORY),
         num_workers=NUM_WORKERS,
         collate_fn=fast_collate_long,
         worker_init_fn=(seed_worker if (NUM_WORKERS and NUM_WORKERS > 0) else None),
         **extra,
     )
 
-def _ddp_setup_if_needed() -> tuple[torch.device, int, int]:
-    # CPU-only mode: do not initialize DDP/CUDA; always run single-process on CPU
-    return torch.device("cpu"), 0, 1
 
-
-def _is_main_process() -> bool:
-    # CPU-only, single process
-    return True
+def _device_setup() -> torch.device:
+    if torch.cuda.is_available():
+        try:
+            torch.backends.cudnn.benchmark = True  # type: ignore[attr-defined]
+        except Exception:
+            pass
+        return torch.device("cuda", 0)
+    return torch.device("cpu")
 
 
 def main() -> None:
-    device, rank, world_size = _ddp_setup_if_needed()
-    if _is_main_process():
-        print("Using device:", device, torch.__version__, "world_size=", world_size)
+    device = _device_setup()
+    print("Using device:", device, torch.__version__)
 
     # Tokenizer
     if FORCE_RETRAIN_TOKENIZER or not TOKENIZER_JSON.exists():
@@ -147,6 +151,18 @@ def main() -> None:
         )
         _mark_only_lora_trainable(model)
 
+    # Activation checkpointing toggle
+    try:
+        (model.module if isinstance(model, nn.DataParallel) else model).checkpoint_blocks = bool(
+            GRAD_CHECKPOINT
+        )
+    except Exception:
+        pass
+
+    # DataParallel wrap for multi-GPU
+    if device.type == "cuda" and torch.cuda.device_count() > 1:
+        print(f"[parallel] DataParallel enabled on {torch.cuda.device_count()} GPUs")
+        model = nn.DataParallel(model)
     model = model.to(device)
 
     # Optimizer
@@ -164,15 +180,15 @@ def main() -> None:
     # Sanity against memmap
     arr = np.memmap(str(TOK_BIN), dtype=np.uint32, mode="r")
     mx_seen = int(arr.max() if arr.size else 0)
-    if _is_main_process():
-        print("[sanity] vocab_size =", vocab_size)
-        print("[sanity] TOK_BIN max id =", mx_seen)
+    print("[sanity] vocab_size =", vocab_size)
+    print("[sanity] TOK_BIN max id =", mx_seen)
     assert mx_seen < vocab_size, (
         f"memmap token id {mx_seen} >= vocab_size {vocab_size} — tokenizer/memmap mismatch"
     )
 
-    crit = nn.CrossEntropyLoss(label_smoothing=0.03)
-    scaler = None  # CPU only
+    LABEL_SMOOTH = 0.03
+    scaler: Optional[torch.cuda.amp.GradScaler]
+    scaler = torch.cuda.amp.GradScaler(enabled=(device.type == "cuda"))
 
     # Meta
     tokenizer_hash = _file_sha256(TOKENIZER_JSON)
@@ -206,19 +222,21 @@ def main() -> None:
     ema: Optional[float] = None
     ema_beta = 0.98
 
-    import torch.nn.functional as F
-
     model.train()
     for ep in range(start_epoch, EPOCHS + 1):
         total_loss = 0.0
         total_count = 0
-        # Single-process CPU training; no sampler epoch needed
-        pbar = tqdm(dl, desc=f"Epoch {ep}/{EPOCHS}", leave=False) if _is_main_process() else dl
+        pbar = tqdm(dl, desc=f"Epoch {ep}/{EPOCHS}", leave=False)
         opt.zero_grad(set_to_none=True)
 
+        is_dp = isinstance(model, nn.DataParallel)
         for it, (xb, yb) in enumerate(pbar):
-            xb = xb.long().to(device, non_blocking=True)
-            yb = yb.long().to(device, non_blocking=True)
+            if is_dp:
+                xb = xb.long()
+                yb = yb.long()
+            else:
+                xb = xb.long().to(device, non_blocking=True)
+                yb = yb.long().to(device, non_blocking=True)
 
             if opt_step < 8:
                 xm, xM = int(xb.min()), int(xb.max())
@@ -232,13 +250,27 @@ def main() -> None:
                 g["lr"] = base_lr
             scheduler_last_lr = base_lr
 
-            logits = model(xb)  # [B, T, V]
-            # Use channel-first CE to reduce memory vs large flatten
-            loss = F.cross_entropy(
-                logits.transpose(1, 2), yb, reduction="mean"
-            ) / ACCUM_STEPS
+            # Forward + last-token loss
+            if scaler.is_enabled():
+                with torch.cuda.amp.autocast(True):
+                    logits = model(xb)
+                    last_logits = logits[:, -1, :]
+                    last_targets = yb[:, -1]
+                    if last_targets.device != last_logits.device:
+                        last_targets = last_targets.to(last_logits.device, non_blocking=True)
+                    loss = _ce_last_light(last_logits, last_targets, label_smoothing=LABEL_SMOOTH) / ACCUM_STEPS
+            else:
+                logits = model(xb)
+                last_logits = logits[:, -1, :]
+                last_targets = yb[:, -1]
+                if last_targets.device != last_logits.device:
+                    last_targets = last_targets.to(last_logits.device, non_blocking=True)
+                loss = _ce_last_light(last_logits, last_targets, label_smoothing=LABEL_SMOOTH) / ACCUM_STEPS
 
-            loss.backward()
+            if scaler.is_enabled():
+                scaler.scale(loss).backward()
+            else:
+                loss.backward()
             del logits
 
             with torch.no_grad():
@@ -249,17 +281,21 @@ def main() -> None:
 
             do_step = ((it + 1) % ACCUM_STEPS == 0)
             if do_step:
-                params = (
-                    p for p in model.parameters() if p.requires_grad and p.grad is not None
-                )
+                params = (p for p in model.parameters() if p.requires_grad and p.grad is not None)
+                if scaler.is_enabled():
+                    scaler.unscale_(opt)
                 torch.nn.utils.clip_grad_norm_(params, 1.0)
-                opt.step()
+                if scaler.is_enabled():
+                    scaler.step(opt)
+                    scaler.update()
+                else:
+                    opt.step()
                 opt.zero_grad(set_to_none=True)
 
                 ema = loss_item if ema is None else (ema_beta * ema + (1 - ema_beta) * loss_item)
                 opt_step += 1
 
-                if opt_step % 1000 == 0 and _is_main_process():
+                if opt_step % 1000 == 0:
                     meta["best_metric"] = best_metric
                     save_checkpoint("latest", model, opt, scaler, opt_step, ep, meta)
                     if ema < best_metric:
@@ -268,7 +304,7 @@ def main() -> None:
                         save_checkpoint("best", model, opt, scaler, opt_step, ep, meta)
                         print(f"\n[best] ema={best_metric:.4f} @ step {opt_step}")
 
-                if opt_step % PREVIEW_INTERVAL == 0 and _is_main_process():
+                if opt_step % PREVIEW_INTERVAL == 0:
                     model.eval()
                     with torch.inference_mode():
                         sample = generate_text(
@@ -281,27 +317,26 @@ def main() -> None:
                             top_p=0.9,
                         )
                     print("[preview]", sample[:240].replace("\n", " "))
+                    if device.type == "cuda":
+                        try:
+                            torch.cuda.empty_cache()
+                        except Exception:
+                            pass
                     model.train()
 
             avg_loss = total_loss / max(1, total_count)
             pbar.set_postfix(loss=float(avg_loss), ema=(float(ema) if ema else None), lr=float(scheduler_last_lr))
 
     # Final sample
-    if _is_main_process():
-        model.eval()
-        with torch.no_grad():
-            seed = tokenizer.encode("こんにちは")[:WINDOW]
-            x = torch.tensor(seed, dtype=torch.long, device=device).unsqueeze(0)
-            logits = model(x)
-            next_id = int(torch.argmax(logits[:, -1, :], dim=-1).item())
-            print("[final]", tokenizer.decode(seed + [next_id]))
-        print("done.")
-    # No DDP teardown needed in CPU-only mode
+    model.eval()
+    with torch.no_grad():
+        seed = tokenizer.encode("こんにちは")[:WINDOW]
+        x = torch.tensor(seed, dtype=torch.long, device=device).unsqueeze(0)
+        logits = model(x)
+        next_id = int(torch.argmax(logits[:, -1, :], dim=-1).item())
+        print("[final]", tokenizer.decode(seed + [next_id]))
+    print("done.")
 
 
 if __name__ == "__main__":
-    # For Windows and frozen executables (PyInstaller, etc.)
-    import multiprocessing as mp
-
-    mp.freeze_support()
     main()

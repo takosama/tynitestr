@@ -65,7 +65,12 @@ def generate_text(
     x = torch.tensor(ids, dtype=torch.long, device=device)[None, :]  # [1, T]
 
     for _ in range(max_new_tokens):
-        logits = model(x)  # [1, T, V]
+        # Ensure context does not exceed position embedding length
+        if isinstance(max_pos, int) and max_pos > 0 and x.size(1) > max_pos:
+            x_in = x[:, -max_pos:]
+        else:
+            x_in = x
+        logits = model(x_in)  # [1, T, V]
         if logits.size(1) == 0:
             # 念のための二重保険（通常ここには来ない）
             x = torch.cat([x, torch.tensor([[_fallback_bos(tokenizer)]], device=device)], dim=1)
