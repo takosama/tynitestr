@@ -143,7 +143,7 @@ class HyenaLM(nn.Module):
         # Optional per-block activation checkpointing (set externally)
         self.checkpoint_blocks: bool = True
 
-    def forward(self, x: torch.Tensor, last_only: bool = False) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, last_only: bool = True) -> torch.Tensor:
         """Forward pass.
 
         Args:

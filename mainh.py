@@ -12,6 +12,10 @@ from pathlib import Path
 from typing import Optional
 import os
 
+# Disable TorchDynamo/torch.compile globally to avoid internal SyntaxError on some setups
+os.environ.setdefault("TORCHDYNAMO_DISABLE", "1")
+os.environ.setdefault("TORCH_COMPILE_DISABLE", "1")
+
 import numpy as np
 import torch
 from torch import nn
@@ -56,6 +60,13 @@ from lora import (
 )
 from optimizer import Lion
 from tokenizer import ByteBPETokenizer, load_corpus_text, train_bpe_from_text
+
+# Best-effort: relax Dynamo error handling if imported
+try:
+    import torch._dynamo as _dynamo  # type: ignore
+    _dynamo.config.suppress_errors = True  # swallow internal graph breaks
+except Exception:
+    pass
 
 
 def _file_sha256(p: Path) -> str:
@@ -164,7 +175,7 @@ def main() -> None:
         print(f"[parallel] DataParallel enabled on {torch.cuda.device_count()} GPUs")
         model = nn.DataParallel(model)
     model = model.to(device)
-
+   
     # Optimizer
     if USE_LORA:
         lora_params = _collect_lora_params(model)
@@ -232,11 +243,12 @@ def main() -> None:
         is_dp = isinstance(model, nn.DataParallel)
         for it, (xb, yb) in enumerate(pbar):
             if is_dp:
-                xb = xb.long().to("cuda")
-                yb = yb.long().to("cuda")
+                # Let DataParallel scatter from CPU
+                xb = xb.long()
+                yb = yb.long()
             else:
-                xb = xb.long().to("cuda", non_blocking=True)
-                yb = yb.long().to("cuda", non_blocking=True)
+                xb = xb.long().to(device, non_blocking=True)
+                yb = yb.long().to(device, non_blocking=True)
 
             if opt_step < 8:
                 xm, xM = int(xb.min()), int(xb.max())
@@ -250,18 +262,28 @@ def main() -> None:
                 g["lr"] = base_lr
             scheduler_last_lr = base_lr
 
-            # Forward + last-token loss
+            # Forward + last-token loss (robust to 2D or 3D logits)
             if scaler.is_enabled():
                 with torch.cuda.amp.autocast(True):
                     logits = model(xb)
-                    last_logits = logits[:, -1, :]
+                    if logits.dim() == 3:
+                        last_logits = logits[:, -1, :]
+                    elif logits.dim() == 2:
+                        last_logits = logits
+                    else:
+                        raise RuntimeError(f"Unexpected logits dim: {tuple(logits.shape)}")
                     last_targets = yb[:, -1]
                     if last_targets.device != last_logits.device:
                         last_targets = last_targets.to(last_logits.device, non_blocking=True)
                     loss = _ce_last_light(last_logits, last_targets, label_smoothing=LABEL_SMOOTH) / ACCUM_STEPS
             else:
                 logits = model(xb)
-                last_logits = logits[:, -1, :]
+                if logits.dim() == 3:
+                    last_logits = logits[:, -1, :]
+                elif logits.dim() == 2:
+                    last_logits = logits
+                else:
+                    raise RuntimeError(f"Unexpected logits dim: {tuple(logits.shape)}")
                 last_targets = yb[:, -1]
                 if last_targets.device != last_logits.device:
                     last_targets = last_targets.to(last_logits.device, non_blocking=True)
@@ -295,7 +317,7 @@ def main() -> None:
                 ema = loss_item if ema is None else (ema_beta * ema + (1 - ema_beta) * loss_item)
                 opt_step += 1
 
-                if opt_step % 100 == 0:
+                if opt_step % 250 == 0:
                     meta["best_metric"] = best_metric
                     save_checkpoint("latest", model, opt, scaler, opt_step, ep, meta)
                     if ema < best_metric:
@@ -304,7 +326,7 @@ def main() -> None:
                         save_checkpoint("best", model, opt, scaler, opt_step, ep, meta)
                         print(f"\n[best] ema={best_metric:.4f} @ step {opt_step}")
 
-                if opt_step % 200 == 0:
+                if opt_step % 100 == 0:
                     model.eval()
                     with torch.inference_mode():
                         sample = generate_text(
@@ -333,7 +355,13 @@ def main() -> None:
         seed = tokenizer.encode("こんにちは")[:WINDOW]
         x = torch.tensor(seed, dtype=torch.long, device=device).unsqueeze(0)
         logits = model(x)
-        next_id = int(torch.argmax(logits[:, -1, :], dim=-1).item())
+        if logits.dim() == 3:
+            last_logits = logits[:, -1, :]
+        elif logits.dim() == 2:
+            last_logits = logits
+        else:
+            raise RuntimeError(f"Unexpected logits dim at final sample: {tuple(logits.shape)}")
+        next_id = int(torch.argmax(last_logits, dim=-1).item())
         print("[final]", tokenizer.decode(seed + [next_id]))
     print("done.")
 
