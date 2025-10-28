@@ -377,25 +377,26 @@ def main() -> None:
                         save_checkpoint("best", model, opt, scaler, opt_step, ep, meta)
                         print(f"\n[best] ema={best_metric:.4f} @ step {opt_step}")
 
-                if opt_step % 100 == 0:
-                    model.eval()
-                    with torch.inference_mode():
-                        sample = generate_text(
-                            model,
-                            tokenizer,
-                            seed_text="こんにちは",
-                            max_new_tokens=60,
-                            temperature=0.8,
-                            top_k=60,
-                            top_p=0.9,
-                        )
-                    print("[preview]", sample[:240].replace("\n", " "))
-                    if device.type == "cuda":
-                        try:
-                            torch.cuda.empty_cache()
-                        except Exception:
-                            pass
-                    model.train()
+# preview block（そのまま置換）
+            if opt_step % 10 == 0:
+                model.eval()
+                with torch.inference_mode():
+                    sample = generate_text(
+                        getattr(model, "module", model),  # ★ unwrap
+                        tokenizer,
+                        seed_text="こんにちは",
+                        max_new_tokens=60,
+                        temperature=0.8,
+                        top_k=60,
+                        top_p=0.9,
+                    )
+                print("[preview]", sample[:240].replace("\n", " "))
+                if device.type == "cuda":
+                    try:
+                        torch.cuda.empty_cache()
+                    except Exception:
+                        pass
+                model.train()
 
             avg_loss = total_loss / max(1, total_count)
             pbar.set_postfix(

@@ -1,6 +1,6 @@
 # TinyNiteSTR — Tiny GPT/HyenaLM Trainer (EN/日本語)
 
-A lightweight, hackable training and generation playground featuring a tiny GPT‑2–style Transformer and a Hyena‑style language model, optional LoRA adapters, simple BPE tokenizer training, memory‑mapped datasets, checkpointing, and text generation.
+A lightweight, hackable training and generation playground featuring a tiny GPT‑style Transformer and a Hyena‑style language model, optional LoRA adapters, simple BPE tokenizer training, memory‑mapped datasets, checkpointing, and text generation.
 
 ---
 
@@ -15,15 +15,15 @@ A lightweight, hackable training and generation playground featuring a tiny GPT�
 - Checkpoint save/load + best/latest tracking (`checkpoint.py`)
 
 ### Requirements
-- Windows 11, Python 3.12+ (3.12 recommended for GPU; 3.13 is CPU‑only for PyTorch as of now)
+- Windows 11, Python 3.12+ (3.12 recommended for GPU; 3.13 typically CPU‑only for PyTorch)
 - For GPU training: NVIDIA GPU + recent driver (CUDA 12.x compatible)
 
 ### Setup
 ```powershell
 python -m venv .venv
 . .venv\Scripts\Activate.ps1
-pip install -r requirements.txt  # base deps (torch installed separately)
-pip install -r requirements-dev.txt  # optional tools
+pip install -r requirements.txt         # base deps (install torch separately)
+pip install -r requirements-dev.txt     # optional dev tools
 ```
 
 Install PyTorch (choose one):
@@ -34,11 +34,6 @@ pip install --index-url https://download.pytorch.org/whl/cu121 torch
 - CPU only:
 ```powershell
 pip install torch
-```
-
-Optional helper script for GPU setup (Python 3.12 required):
-```powershell
-powershell -ExecutionPolicy Bypass -File scripts\setup_cuda121.ps1 -Py312Path "C:\\Python312\\python.exe"
 ```
 
 ### Tokenizer
@@ -63,47 +58,46 @@ python generate.py  # uses latest/best checkpoint; adjust paths in script or con
 ```
 
 ### Project Structure
-- `model.py` — TinyGPT2 (Transformer)
-- `hyena.py` — HyenaLM (causal depthwise conv + MLP)
-- `optimizer.py` — optimizers (e.g., Lion)
-- `data.py`, `data_fast.py` — preprocessing, memmap datasets, collate
-- `tokenizer.py` — Byte‑BPE training + encode/decode
-- `lora.py` — LoRA modules and mapping helpers
-- `checkpoint.py` — save/resume utilities
-- `main.py`, `main2.py`, `mainh.py` — training entry points (HyenaLM is GPU‑only)
-- `generate.py` — text generation
-- `checkpoints*/` — saved weights; `tokenizer.json` — tokenizer
+- Core: `model.py` (TinyGPT2), `hyena.py` (HyenaLM), `optimizer.py`, `data.py`/`data_fast.py`, `tokenizer.py`, `lora.py`, `checkpoint.py`, `config.py`
+- Entry: `main.py` (TinyGPT2), `mainh.py` (HyenaLM, GPU‑only), `main2.py` (alt), `createmodel.py` / `chengemodeleasy.py` (init), `generate.py`, `ime.py`
+- Artifacts: `checkpoints*/` (weights), `tokenizer.json`, corpora files (e.g., `corpus_*.u*`)
 
 ### Notes
 - Hyena trainer (`mainh.py`) requires CUDA; it will raise if no GPU is available. It also sets `PYTORCH_CUDA_ALLOC_CONF=max_split_size_mb:128,expandable_segments:True` to reduce fragmentation.
-- LoRA applies to linear layers. Convolution layers in Hyena remain unaffected, which is fine.
-- If you encounter CUDA OOM, reduce `BATCH_SIZE` and/or `WINDOW`, enable gradient checkpointing (already enabled by default), and increase `ACCUM_STEPS` to maintain effective batch size.
+- LoRA applies to linear layers. Convolution layers in Hyena remain unaffected.
+- If you encounter CUDA OOM, reduce `BATCH_SIZE` and/or `WINDOW`, keep gradient checkpointing on, and increase `ACCUM_STEPS` to maintain effective batch size.
+
+### Development
+- Style: 4‑space indent; keep functions/vars `snake_case`, classes `PascalCase`.
+- Format/lint: `black .`, `isort .`, `ruff check .`
+- Tests: `pytest -q` or with coverage `pytest --cov=. --cov-report=term-missing`
+- Do not commit large binaries. Keep checkpoint/generate paths consistent with `config.py`.
 
 ---
 
 ## 日本語
 
-### 特長
-- TinyGPT2（Transformer）: `model.py`
-- HyenaLM（因果 depthwise 畳み込み + MLP）: `hyena.py`（`mainh.py` は GPU 専用）
-- LoRA による軽量微調整: `lora.py`
-- Byte‑BPE トークナイザの学習と利用: `tokenizer.py`
-- メモリマップによる高速データパス: `data.py` / `data_fast.py`
-- チェックポイント保存/復元（最新/ベスト）: `checkpoint.py`
+### 特徴
+- TinyGPT2（Transformer）モデル（`model.py`）
+- HyenaLM（因果的な深さ方向畳み込み + MLP）（`hyena.py`）— 学習エントリは `mainh.py`（GPU 専用）
+- 線形層に対する軽量な微調整 LoRA（`lora.py`）
+- Byte‑BPE トークナイザの学習と利用（`tokenizer.py`）
+- メモリマップによる高速データ処理（`data.py` + `data_fast.py`）
+- チェックポイント保存/復元（最新/ベストの管理）（`checkpoint.py`）
 
-### 必要環境
-- Windows 11, Python 3.12 以上（GPU 利用は 3.12 推奨。3.13 は現状 CPU のみ）
-- GPU 学習には NVIDIA GPU と最新ドライバ（CUDA 12.x 互換）が必要
+### 要件
+- Windows 11, Python 3.12 以上（GPU を使う場合は 3.12 推奨。3.13 は多くの環境で CPU のみ）
+- GPU 学習には NVIDIA GPU と CUDA 12.x 互換のドライバ
 
 ### セットアップ
 ```powershell
 python -m venv .venv
 . .venv\Scripts\Activate.ps1
-pip install -r requirements.txt  # ベース依存（torch は別途）
-pip install -r requirements-dev.txt  # 任意
+pip install -r requirements.txt         # 基本依存（torch は別途）
+pip install -r requirements-dev.txt     # 開発用ツール（任意）
 ```
 
-PyTorch のインストール（いずれか）
+PyTorch のインストール（いずれか）:
 - GPU（CUDA 12.1 / Python 3.12）
 ```powershell
 pip install --index-url https://download.pytorch.org/whl/cu121 torch
@@ -113,18 +107,13 @@ pip install --index-url https://download.pytorch.org/whl/cu121 torch
 pip install torch
 ```
 
-スクリプトで GPU 環境を準備（Python 3.12 必須）
-```powershell
-powershell -ExecutionPolicy Bypass -File scripts\setup_cuda121.ps1 -Py312Path "C:\\Python312\\python.exe"
-```
-
 ### トークナイザ
 ```powershell
-python tokenizer.py  # tokenizer.json を生成
+python tokenizer.py  # tokenizer.json を作成
 ```
 
 ### 学習
-`config.py`（特に `CORPUS`, `WINDOW`）を調整してから実行します。
+`config.py` のパスやハイパーパラメータ（特に `CORPUS`, `WINDOW`）を調整してから実行します。
 ```powershell
 # TinyGPT2（CPU/GPU）
 python main.py
@@ -132,19 +121,26 @@ python main.py
 # HyenaLM（GPU 専用）
 python mainh.py
 ```
+チェックポイントは `checkpoints/` に保存され、最新/ベストがローテーション管理されます。
 
 ### 生成
 ```powershell
-python generate.py  # 最新/ベストのチェックポイントを使用（必要ならパス調整）
+python generate.py  # 最新/ベストのチェックポイントを使用（必要に応じてパスを調整）
 ```
 
-### 構成
-- `model.py` / `hyena.py`（Hyena） / `lora.py`
-- `data.py` / `data_fast.py`（前処理・メモリマップ Dataset）
-- `checkpoint.py` / `optimizer.py`
-- `main.py` / `main2.py` / `mainh.py`（Hyena は GPU 専用） / `generate.py`
-- `checkpoints*/`（保存先）/ `tokenizer.json`（トークナイザ）
+### プロジェクト構成
+- コア: `model.py`（TinyGPT2）, `hyena.py`（HyenaLM）, `optimizer.py`, `data.py`/`data_fast.py`, `tokenizer.py`, `lora.py`, `checkpoint.py`, `config.py`
+- エントリ: `main.py`（TinyGPT2）, `mainh.py`（HyenaLM, GPU 専用）, `main2.py`（代替）, `createmodel.py` / `chengemodeleasy.py`（初期化）, `generate.py`, `ime.py`
+- 生成物: `checkpoints*/`（重み）, `tokenizer.json`, コーパス関連ファイル（例: `corpus_*.u*`）
 
-### メモ
-- `mainh.py` は CUDA 前提です（GPU 未検出時はエラー）。`PYTORCH_CUDA_ALLOC_CONF` を自動設定して断片化を軽減します。
-- CUDA OOM の場合は `BATCH_SIZE`/`WINDOW` を下げ、`ACCUM_STEPS` を増やしてください。
+### 補足
+- `mainh.py` は CUDA 前提です（GPU が無い場合はエラー）。`PYTORCH_CUDA_ALLOC_CONF` を設定してメモリ断片化を抑えます。
+- LoRA は線形層にのみ適用されます（Hyena の畳み込み層は対象外）。
+- CUDA のメモリ不足（OOM）の場合は `BATCH_SIZE` や `WINDOW` を下げ、勾配チェックポイントを有効のまま、`ACCUM_STEPS` を増やして実効バッチを保ちます。
+
+### 開発メモ
+- コーディング規約: インデント 4 スペース、`snake_case` / `PascalCase` を遵守。
+- 整形/静的解析: `black .`、`isort .`、`ruff check .`
+- テスト: `pytest -q`、カバレッジは `pytest --cov=. --cov-report=term-missing`
+- 大きなバイナリのコミットは避け、`config.py` と生成スクリプトのパス整合性を維持してください。
+

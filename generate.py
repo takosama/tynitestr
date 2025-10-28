@@ -75,7 +75,7 @@ def generate_text(
             x_in = x[:, -max_pos:]
         else:
             x_in = x
-        logits = model(x_in, last_only=False)  # [1, T, V]
+        logits = model(x_in, last_only=True)  # [1, T, V]
         if logits.size(1) == 0:
             # Double-safety; typically this never happens
             x = torch.cat(
