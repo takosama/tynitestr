@@ -99,13 +99,13 @@ class HyenaLM(nn.Module):
         vocab_size: int,
         d_model: int = D_MODEL,
         n_layer: int = N_LAYER,
-        block_size: int = 512,
+        block_size: int = 32,
         dropout: float = 0.0,
         kernel_size: int = 17,
     ):
         super().__init__()
         self.wte = nn.Embedding(vocab_size, d_model)
-        # Keep wpe for interface compatibility with generate.py
+        # ty with generate.py
         self.wpe = nn.Embedding(block_size, d_model)
         self.drop = nn.Dropout(dropout)
 

@@ -1,4 +1,4 @@
-"""
+﻿"""
 Windows-friendly HyenaLM trainer with CPU DataLoader and GPU model.
 
 - CPU DataLoader (optional pinned memory)
@@ -13,12 +13,8 @@ from hashlib import sha256
 from pathlib import Path
 from typing import Optional
 
-# Disable TorchDynamo/torch.compile globally to avoid internal SyntaxError on some setups
-os.environ.setdefault("TORCHDYNAMO_DISABLE", "1")
-os.environ.setdefault("TORCH_COMPILE_DISABLE", "1")
-os.environ.setdefault(
-    "PYTORCH_CUDA_ALLOC_CONF", "max_split_size_mb:128,expandable_segments:True"
-)
+# Ensure runtime/env defaults are applied before importing torch
+import config as _cfg  # noqa: F401
 
 import numpy as np
 import torch
@@ -35,14 +31,19 @@ from config import (
     EPOCHS,
     FORCE_RETRAIN_TOKENIZER,
     GRAD_CHECKPOINT,
+    EMA_BETA,
+    GRAD_CLIP_NORM,
     LORA_ALPHA,
     LORA_DROPOUT,
     LORA_R,
     LORA_TARGET_LM_HEAD,
+    HYENA_COMPILE_MODE,
+    HYENA_SAVE_EVERY,
     LR,
     MODEL_SIZE,
     NUM_WORKERS,
     PIN_MEMORY,
+    PREVIEW_EVERY,
     RUN_ID,
     TOK_BIN,
     TOKENIZER_JSON,
@@ -50,6 +51,8 @@ from config import (
     VOCAB_SIZE,
     WEIGHT_DECAY,
     WINDOW,
+    LABEL_SMOOTH,
+    WARMUP_STEPS,
 )
 from data import build_memmap_tokens, preprocess_corpus
 from data_fast import FastMemmapNexTokDataset, fast_collate_long
@@ -227,9 +230,8 @@ def main() -> None:
     print("[sanity] TOK_BIN max id =", mx_seen)
     assert (
         mx_seen < vocab_size
-    ), f"memmap token id {mx_seen} >= vocab_size {vocab_size} — tokenizer/memmap mismatch"
+    ), f"memmap token id {mx_seen} >= vocab_size {vocab_size} 窶・tokenizer/memmap mismatch"
 
-    LABEL_SMOOTH = 0.03
     scaler: Optional[torch.cuda.amp.GradScaler]
     scaler = torch.cuda.amp.GradScaler(enabled=(device.type == "cuda"))
 
@@ -247,12 +249,10 @@ def main() -> None:
     best_metric = best_metric or float("inf")
 
     n_params = sum(p.numel() for p in model.parameters())
-    print(f"Model ready — vocab={vocab_size} params={n_params:,}")
+    print(f"Model ready 窶・vocab={vocab_size} params={n_params:,}")
 
     # LR schedule
     total_steps_est = max(1, len(dl)) * max(1, EPOCHS)
-    WARMUP_STEPS = 100
-
     def lr_schedule(step: int) -> float:
         if step < WARMUP_STEPS:
             return (step + 1) / WARMUP_STEPS
@@ -262,8 +262,9 @@ def main() -> None:
     # Train loop
     opt_step = global_step
     ema: Optional[float] = None
-    ema_beta = 0.98
-
+    ### START_TODO: 鬮倬溷喧MAX
+    model=torch.compile(model, mode=HYENA_COMPILE_MODE)
+    #END_TODO
     model.train()
     for ep in range(start_epoch, EPOCHS + 1):
         total_loss = 0.0
@@ -353,7 +354,7 @@ def main() -> None:
                 )
                 if scaler.is_enabled():
                     scaler.unscale_(opt)
-                torch.nn.utils.clip_grad_norm_(params, 1.0)
+                torch.nn.utils.clip_grad_norm_(params, GRAD_CLIP_NORM)
                 if scaler.is_enabled():
                     scaler.step(opt)
                     scaler.update()
@@ -364,11 +365,11 @@ def main() -> None:
                 ema = (
                     loss_item
                     if ema is None
-                    else (ema_beta * ema + (1 - ema_beta) * loss_item)
+                    else (EMA_BETA * ema + (1 - EMA_BETA) * loss_item)
                 )
                 opt_step += 1
 
-                if opt_step % 250 == 0:
+                if opt_step % HYENA_SAVE_EVERY == 0:
                     meta["best_metric"] = best_metric
                     save_checkpoint("latest", model, opt, scaler, opt_step, ep, meta)
                     if ema < best_metric:
@@ -377,20 +378,19 @@ def main() -> None:
                         save_checkpoint("best", model, opt, scaler, opt_step, ep, meta)
                         print(f"\n[best] ema={best_metric:.4f} @ step {opt_step}")
 
-# preview block（そのまま置換）
-            if opt_step % 10 == 0:
-                model.eval()
-                with torch.inference_mode():
-                    sample = generate_text(
-                        getattr(model, "module", model),  # ★ unwrap
-                        tokenizer,
-                        seed_text="こんにちは",
-                        max_new_tokens=60,
-                        temperature=0.8,
-                        top_k=60,
-                        top_p=0.9,
-                    )
-                print("[preview]", sample[:240].replace("\n", " "))
+                if opt_step % PREVIEW_EVERY == 0:
+                    model.eval()
+                    with torch.inference_mode():
+                        sample = generate_text(
+                            getattr(model, "module", model),  # 笘・unwrap
+                            tokenizer,
+                            seed_text="こんにちは",
+                            max_new_tokens=60,
+                            temperature=0.8,
+                            top_k=60,
+                            top_p=0.9,
+                        )
+                        print("[preview]", sample[:240].replace("\n", " "))
                 if device.type == "cuda":
                     try:
                         torch.cuda.empty_cache()
@@ -408,7 +408,7 @@ def main() -> None:
     # Final sample
     model.eval()
     with torch.no_grad():
-        seed = tokenizer.encode("こんにちは")[:WINDOW]
+        seed = tokenizer.encode("縺薙ｓ縺ｫ縺｡縺ｯ")[:WINDOW]
         x = torch.tensor(seed, dtype=torch.long, device=device).unsqueeze(0)
         logits = model(x)
         last_logits = _last_logits(logits)
