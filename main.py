@@ -6,11 +6,10 @@ Windows-friendly trainer using CPU DataLoader and DataParallel (DP).
 - Last-token-only loss for lower memory, AMP on CUDA
 """
 
-from hashlib import sha256
 import math
+from hashlib import sha256
 from pathlib import Path
 from typing import Optional
-import os
 
 import numpy as np
 import torch
@@ -23,11 +22,9 @@ from config import (
     ACCUM_STEPS,
     BATCH_SIZE,
     BETAS,
-    CSV_SEP,
-    CSV_TEXT_COL,
+    CORPUS,
     EPOCHS,
     FORCE_RETRAIN_TOKENIZER,
-    PIN_MEMORY,
     GRAD_CHECKPOINT,
     LORA_ALPHA,
     LORA_DROPOUT,
@@ -36,6 +33,7 @@ from config import (
     LR,
     MODEL_SIZE,
     NUM_WORKERS,
+    PIN_MEMORY,
     RUN_ID,
     TOK_BIN,
     TOKENIZER_JSON,
@@ -43,7 +41,6 @@ from config import (
     VOCAB_SIZE,
     WEIGHT_DECAY,
     WINDOW,
-    CORPUS,
 )
 from data import build_memmap_tokens, preprocess_corpus
 from data_fast import FastMemmapNexTokDataset, fast_collate_long
@@ -81,6 +78,7 @@ def _ce_last_light(
 
 def seed_worker(_wid: int):
     import numpy as _np
+
     s = torch.initial_seed() % (2**32)
     _np.random.seed(s)
 
@@ -153,9 +151,9 @@ def main() -> None:
 
     # Activation checkpointing toggle
     try:
-        (model.module if isinstance(model, nn.DataParallel) else model).checkpoint_blocks = bool(
-            GRAD_CHECKPOINT
-        )
+        (
+            model.module if isinstance(model, nn.DataParallel) else model
+        ).checkpoint_blocks = bool(GRAD_CHECKPOINT)
     except Exception:
         pass
 
@@ -182,9 +180,9 @@ def main() -> None:
     mx_seen = int(arr.max() if arr.size else 0)
     print("[sanity] vocab_size =", vocab_size)
     print("[sanity] TOK_BIN max id =", mx_seen)
-    assert mx_seen < vocab_size, (
-        f"memmap token id {mx_seen} >= vocab_size {vocab_size} — tokenizer/memmap mismatch"
-    )
+    assert (
+        mx_seen < vocab_size
+    ), f"memmap token id {mx_seen} >= vocab_size {vocab_size} — tokenizer/memmap mismatch"
 
     LABEL_SMOOTH = 0.03
     scaler: Optional[torch.cuda.amp.GradScaler]
@@ -257,15 +255,29 @@ def main() -> None:
                     last_logits = logits[:, -1, :]
                     last_targets = yb[:, -1]
                     if last_targets.device != last_logits.device:
-                        last_targets = last_targets.to(last_logits.device, non_blocking=True)
-                    loss = _ce_last_light(last_logits, last_targets, label_smoothing=LABEL_SMOOTH) / ACCUM_STEPS
+                        last_targets = last_targets.to(
+                            last_logits.device, non_blocking=True
+                        )
+                    loss = (
+                        _ce_last_light(
+                            last_logits, last_targets, label_smoothing=LABEL_SMOOTH
+                        )
+                        / ACCUM_STEPS
+                    )
             else:
                 logits = model(xb)
                 last_logits = logits[:, -1, :]
                 last_targets = yb[:, -1]
                 if last_targets.device != last_logits.device:
-                    last_targets = last_targets.to(last_logits.device, non_blocking=True)
-                loss = _ce_last_light(last_logits, last_targets, label_smoothing=LABEL_SMOOTH) / ACCUM_STEPS
+                    last_targets = last_targets.to(
+                        last_logits.device, non_blocking=True
+                    )
+                loss = (
+                    _ce_last_light(
+                        last_logits, last_targets, label_smoothing=LABEL_SMOOTH
+                    )
+                    / ACCUM_STEPS
+                )
 
             if scaler.is_enabled():
                 scaler.scale(loss).backward()
@@ -279,9 +291,13 @@ def main() -> None:
                 total_loss += loss_item * bs
                 total_count += bs
 
-            do_step = ((it + 1) % ACCUM_STEPS == 0)
+            do_step = (it + 1) % ACCUM_STEPS == 0
             if do_step:
-                params = (p for p in model.parameters() if p.requires_grad and p.grad is not None)
+                params = (
+                    p
+                    for p in model.parameters()
+                    if p.requires_grad and p.grad is not None
+                )
                 if scaler.is_enabled():
                     scaler.unscale_(opt)
                 torch.nn.utils.clip_grad_norm_(params, 1.0)
@@ -292,7 +308,11 @@ def main() -> None:
                     opt.step()
                 opt.zero_grad(set_to_none=True)
 
-                ema = loss_item if ema is None else (ema_beta * ema + (1 - ema_beta) * loss_item)
+                ema = (
+                    loss_item
+                    if ema is None
+                    else (ema_beta * ema + (1 - ema_beta) * loss_item)
+                )
                 opt_step += 1
 
                 if opt_step % 1000 == 0:
@@ -325,7 +345,11 @@ def main() -> None:
                     model.train()
 
             avg_loss = total_loss / max(1, total_count)
-            pbar.set_postfix(loss=float(avg_loss), ema=(float(ema) if ema else None), lr=float(scheduler_last_lr))
+            pbar.set_postfix(
+                loss=float(avg_loss),
+                ema=(float(ema) if ema else None),
+                lr=float(scheduler_last_lr),
+            )
 
     # Final sample
     model.eval()

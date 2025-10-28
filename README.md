@@ -8,7 +8,7 @@ A lightweight, hackable training and generation playground featuring a tiny GPT�
 
 ### Features
 - TinyGPT2 (Transformer) model (`model.py`)
-- HyenaLM (depthwise causal conv + MLP) (`Tynigptkarahyena.py`) — GPU‑only trainer in `mainh.py`
+- HyenaLM (depthwise causal conv + MLP) (`hyena.py`) — GPU‑only trainer in `mainh.py`
 - LoRA for efficient finetuning on linear layers (`lora.py`)
 - Byte‑BPE tokenizer training and use (`tokenizer.py`)
 - Fast data path via memmaps (`data.py` + `data_fast.py`)
@@ -64,7 +64,7 @@ python generate.py  # uses latest/best checkpoint; adjust paths in script or con
 
 ### Project Structure
 - `model.py` — TinyGPT2 (Transformer)
-- `Tynigptkarahyena.py` — HyenaLM (causal depthwise conv + MLP)
+- `hyena.py` — HyenaLM (causal depthwise conv + MLP)
 - `optimizer.py` — optimizers (e.g., Lion)
 - `data.py`, `data_fast.py` — preprocessing, memmap datasets, collate
 - `tokenizer.py` — Byte‑BPE training + encode/decode
@@ -85,7 +85,7 @@ python generate.py  # uses latest/best checkpoint; adjust paths in script or con
 
 ### 特長
 - TinyGPT2（Transformer）: `model.py`
-- HyenaLM（因果 depthwise 畳み込み + MLP）: `Tynigptkarahyena.py`（`mainh.py` は GPU 専用）
+- HyenaLM（因果 depthwise 畳み込み + MLP）: `hyena.py`（`mainh.py` は GPU 専用）
 - LoRA による軽量微調整: `lora.py`
 - Byte‑BPE トークナイザの学習と利用: `tokenizer.py`
 - メモリマップによる高速データパス: `data.py` / `data_fast.py`
@@ -139,7 +139,7 @@ python generate.py  # 最新/ベストのチェックポイントを使用（必
 ```
 
 ### 構成
-- `model.py` / `Tynigptkarahyena.py`（Hyena） / `lora.py`
+- `model.py` / `hyena.py`（Hyena） / `lora.py`
 - `data.py` / `data_fast.py`（前処理・メモリマップ Dataset）
 - `checkpoint.py` / `optimizer.py`
 - `main.py` / `main2.py` / `mainh.py`（Hyena は GPU 専用） / `generate.py`
@@ -148,4 +148,3 @@ python generate.py  # 最新/ベストのチェックポイントを使用（必
 ### メモ
 - `mainh.py` は CUDA 前提です（GPU 未検出時はエラー）。`PYTORCH_CUDA_ALLOC_CONF` を自動設定して断片化を軽減します。
 - CUDA OOM の場合は `BATCH_SIZE`/`WINDOW` を下げ、`ACCUM_STEPS` を増やしてください。
-

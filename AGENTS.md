@@ -1,7 +1,7 @@
 # Repository Guidelines
 
 ## Project Structure & Module Organization
-- Core modules: `model.py` (TinyGPT2), `Tynigptkarahyena.py` (HyenaLM), `optimizer.py` (training utils), `data.py` (dataset/token prep), `tokenizer.py` (vocab + encode/decode), `lora.py` (LoRA helpers), `checkpoint.py` (save/load), `config.py` (hyperparams).
+- Core modules: `model.py` (TinyGPT2), `hyena.py` (HyenaLM), `optimizer.py` (training utils), `data.py` (dataset/token prep), `tokenizer.py` (vocab + encode/decode), `lora.py` (LoRA helpers), `checkpoint.py` (save/load), `config.py` (hyperparams).
 - Entry points: `main.py` (TinyGPT2 training), `mainh.py` (HyenaLM training, GPU-only), `main2.py` (alt trainer), `createmodel.py` or `chengemodeleasy.py` (model init), `generate.py` (text generation), `ime.py` (IME/demo), `old/` (legacy).
 - Artifacts: `checkpoints*/` (model weights), `tokenizer.json`, corpora files (e.g., `tweets_clean.txt`, `corpus_*.u*`). Avoid committing new large binaries.
 

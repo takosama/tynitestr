@@ -1,20 +1,24 @@
 """
-Windows-friendly trainer using CPU DataLoader and DataParallel (DP).
+Windows-friendly HyenaLM trainer with CPU DataLoader and GPU model.
 
-- CPU DataLoader (optional pinned memory) + GPU model
+- CPU DataLoader (optional pinned memory)
 - Automatic DataParallel on multi-GPU
 - Last-token-only loss for lower memory, AMP on CUDA
+- Robust to 2D/3D logits and includes CUDA allocator tuning
 """
 
-from hashlib import sha256
 import math
+import os
+from hashlib import sha256
 from pathlib import Path
 from typing import Optional
-import os
 
 # Disable TorchDynamo/torch.compile globally to avoid internal SyntaxError on some setups
 os.environ.setdefault("TORCHDYNAMO_DISABLE", "1")
 os.environ.setdefault("TORCH_COMPILE_DISABLE", "1")
+os.environ.setdefault(
+    "PYTORCH_CUDA_ALLOC_CONF", "max_split_size_mb:128,expandable_segments:True"
+)
 
 import numpy as np
 import torch
@@ -22,17 +26,14 @@ from torch import nn
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
-from Tynigptkarahyena import HyenaLM
 from checkpoint import save_checkpoint, try_resume
 from config import (
     ACCUM_STEPS,
     BATCH_SIZE,
     BETAS,
-    CSV_SEP,
-    CSV_TEXT_COL,
+    CORPUS,
     EPOCHS,
     FORCE_RETRAIN_TOKENIZER,
-    PIN_MEMORY,
     GRAD_CHECKPOINT,
     LORA_ALPHA,
     LORA_DROPOUT,
@@ -41,6 +42,7 @@ from config import (
     LR,
     MODEL_SIZE,
     NUM_WORKERS,
+    PIN_MEMORY,
     RUN_ID,
     TOK_BIN,
     TOKENIZER_JSON,
@@ -48,11 +50,11 @@ from config import (
     VOCAB_SIZE,
     WEIGHT_DECAY,
     WINDOW,
-    CORPUS,
 )
 from data import build_memmap_tokens, preprocess_corpus
 from data_fast import FastMemmapNexTokDataset, fast_collate_long
 from generate import generate_text
+from hyena import HyenaLM
 from lora import (
     _apply_lora_to_model,
     _collect_lora_params,
@@ -64,6 +66,7 @@ from tokenizer import ByteBPETokenizer, load_corpus_text, train_bpe_from_text
 # Best-effort: relax Dynamo error handling if imported
 try:
     import torch._dynamo as _dynamo  # type: ignore
+
     _dynamo.config.suppress_errors = True  # swallow internal graph breaks
 except Exception:
     pass
@@ -90,8 +93,18 @@ def _ce_last_light(
     return nll.mean()
 
 
+def _last_logits(logits: torch.Tensor) -> torch.Tensor:
+    """Return last-token logits with shape [B, V] regardless of input rank."""
+    if logits.dim() == 3:
+        return logits[:, -1, :]
+    if logits.dim() == 2:
+        return logits
+    raise RuntimeError(f"Unexpected logits dim: {tuple(logits.shape)}")
+
+
 def seed_worker(_wid: int):
     import numpy as _np
+
     s = torch.initial_seed() % (2**32)
     _np.random.seed(s)
 
@@ -115,44 +128,54 @@ def _make_dataloader() -> DataLoader:
     )
 
 
-def _device_setup() -> torch.device:
-    if torch.cuda.is_available():
-        try:
-            torch.backends.cudnn.benchmark = True  # type: ignore[attr-defined]
-        except Exception:
-            pass
-        return torch.device("cuda", 0)
-    return torch.device("cpu")
+def _device_setup(require_cuda: bool = True) -> torch.device:
+    """Select device and optionally enforce CUDA. Prints basic GPU info."""
+    if not torch.cuda.is_available():
+        if require_cuda:
+            raise RuntimeError(
+                "CUDA GPU not available; install torch with CUDA (e.g., cu121/cu124)."
+            )
+        return torch.device("cpu")
+    try:
+        torch.backends.cudnn.benchmark = True  # type: ignore[attr-defined]
+        if hasattr(torch, "set_float32_matmul_precision"):
+            torch.set_float32_matmul_precision("high")
+    except Exception:
+        pass
+    try:
+        n_gpu = torch.cuda.device_count()
+        name0 = torch.cuda.get_device_name(0)
+        print(f"CUDA GPUs: {n_gpu} | [0]: {name0}")
+    except Exception:
+        pass
+    return torch.device("cuda", 0)
 
 
-def main() -> None:
-    device = _device_setup()
-    print("Using device:", device, torch.__version__)
-
-    # Tokenizer
+def _prepare_tokenizer_and_memmap() -> tuple[ByteBPETokenizer, int]:
+    """Train/load tokenizer, preprocess corpus, build memmap, and return vocab size."""
     if FORCE_RETRAIN_TOKENIZER or not TOKENIZER_JSON.exists():
         _tmp_text = load_corpus_text(CORPUS)
         train_bpe_from_text(_tmp_text, VOCAB_SIZE)
     tokenizer = ByteBPETokenizer(str(TOKENIZER_JSON))
 
-    # Dataset / memmap
     cleaned = preprocess_corpus(CORPUS)
     mx_id = max(tokenizer.vocab.values())
     if getattr(tokenizer, "special", None):
         mx_id = max(mx_id, *tokenizer.special.values())
     vocab_size = mx_id + 1
     build_memmap_tokens(cleaned, tokenizer)
+    return tokenizer, vocab_size
 
-    dl = _make_dataloader()
 
-    # Model (Hyena-based LM)
+def _build_model(vocab_size: int) -> nn.Module:
+    """Construct HyenaLM and apply optional LoRA and checkpointing flag."""
     model = HyenaLM(vocab_size=vocab_size, block_size=WINDOW)
     if not USE_LORA:
-        print("[MODE] Plain GPT (no LoRA)")
+        print("[MODE] Plain HyenaLM (no LoRA)")
         for p in model.parameters():
             p.requires_grad = True
     else:
-        print("[MODE] GPT + LoRA")
+        print("[MODE] HyenaLM + LoRA)")
         _apply_lora_to_model(
             model,
             r=LORA_R,
@@ -161,21 +184,30 @@ def main() -> None:
             target_lm_head=LORA_TARGET_LM_HEAD,
         )
         _mark_only_lora_trainable(model)
-
-    # Activation checkpointing toggle
     try:
-        (model.module if isinstance(model, nn.DataParallel) else model).checkpoint_blocks = bool(
-            GRAD_CHECKPOINT
-        )
+        model.checkpoint_blocks = bool(GRAD_CHECKPOINT)
     except Exception:
         pass
+    return model
+
+
+def main() -> None:
+    device = _device_setup(require_cuda=True)
+    print("Using device:", device, torch.__version__)
+
+    # Tokenizer + dataset/memmap + dataloader
+    tokenizer, vocab_size = _prepare_tokenizer_and_memmap()
+    dl = _make_dataloader()
+
+    # Model (Hyena-based LM)
+    model = _build_model(vocab_size)
 
     # DataParallel wrap for multi-GPU
     if device.type == "cuda" and torch.cuda.device_count() > 1:
         print(f"[parallel] DataParallel enabled on {torch.cuda.device_count()} GPUs")
         model = nn.DataParallel(model)
     model = model.to(device)
-   
+
     # Optimizer
     if USE_LORA:
         lora_params = _collect_lora_params(model)
@@ -193,9 +225,9 @@ def main() -> None:
     mx_seen = int(arr.max() if arr.size else 0)
     print("[sanity] vocab_size =", vocab_size)
     print("[sanity] TOK_BIN max id =", mx_seen)
-    assert mx_seen < vocab_size, (
-        f"memmap token id {mx_seen} >= vocab_size {vocab_size} — tokenizer/memmap mismatch"
-    )
+    assert (
+        mx_seen < vocab_size
+    ), f"memmap token id {mx_seen} >= vocab_size {vocab_size} — tokenizer/memmap mismatch"
 
     LABEL_SMOOTH = 0.03
     scaler: Optional[torch.cuda.amp.GradScaler]
@@ -228,7 +260,6 @@ def main() -> None:
         return 0.1 + 0.9 * 0.5 * (1 + math.cos(math.pi * min(1.0, t)))
 
     # Train loop
-    PREVIEW_INTERVAL = 200
     opt_step = global_step
     ema: Optional[float] = None
     ema_beta = 0.98
@@ -262,32 +293,44 @@ def main() -> None:
                 g["lr"] = base_lr
             scheduler_last_lr = base_lr
 
-            # Forward + last-token loss (robust to 2D or 3D logits)
+            # Forward + last-token loss (robust to 2D/3D logits)
             if scaler.is_enabled():
-                with torch.cuda.amp.autocast(True):
-                    logits = model(xb)
-                    if logits.dim() == 3:
-                        last_logits = logits[:, -1, :]
-                    elif logits.dim() == 2:
-                        last_logits = logits
-                    else:
-                        raise RuntimeError(f"Unexpected logits dim: {tuple(logits.shape)}")
+                bf16_ok = bool(
+                    getattr(torch.cuda, "is_bf16_supported", lambda: False)()
+                )
+                cm = (
+                    torch.cuda.amp.autocast(dtype=torch.bfloat16)
+                    if bf16_ok
+                    else torch.cuda.amp.autocast()
+                )
+                with cm:
+                    logits = model(xb, last_only=True)
+                    last_logits = _last_logits(logits)
                     last_targets = yb[:, -1]
                     if last_targets.device != last_logits.device:
-                        last_targets = last_targets.to(last_logits.device, non_blocking=True)
-                    loss = _ce_last_light(last_logits, last_targets, label_smoothing=LABEL_SMOOTH) / ACCUM_STEPS
+                        last_targets = last_targets.to(
+                            last_logits.device, non_blocking=True
+                        )
+                    loss = (
+                        _ce_last_light(
+                            last_logits, last_targets, label_smoothing=LABEL_SMOOTH
+                        )
+                        / ACCUM_STEPS
+                    )
             else:
-                logits = model(xb)
-                if logits.dim() == 3:
-                    last_logits = logits[:, -1, :]
-                elif logits.dim() == 2:
-                    last_logits = logits
-                else:
-                    raise RuntimeError(f"Unexpected logits dim: {tuple(logits.shape)}")
+                logits = model(xb, last_only=True)
+                last_logits = _last_logits(logits)
                 last_targets = yb[:, -1]
                 if last_targets.device != last_logits.device:
-                    last_targets = last_targets.to(last_logits.device, non_blocking=True)
-                loss = _ce_last_light(last_logits, last_targets, label_smoothing=LABEL_SMOOTH) / ACCUM_STEPS
+                    last_targets = last_targets.to(
+                        last_logits.device, non_blocking=True
+                    )
+                loss = (
+                    _ce_last_light(
+                        last_logits, last_targets, label_smoothing=LABEL_SMOOTH
+                    )
+                    / ACCUM_STEPS
+                )
 
             if scaler.is_enabled():
                 scaler.scale(loss).backward()
@@ -301,9 +344,13 @@ def main() -> None:
                 total_loss += loss_item * bs
                 total_count += bs
 
-            do_step = ((it + 1) % ACCUM_STEPS == 0)
+            do_step = (it + 1) % ACCUM_STEPS == 0
             if do_step:
-                params = (p for p in model.parameters() if p.requires_grad and p.grad is not None)
+                params = (
+                    p
+                    for p in model.parameters()
+                    if p.requires_grad and p.grad is not None
+                )
                 if scaler.is_enabled():
                     scaler.unscale_(opt)
                 torch.nn.utils.clip_grad_norm_(params, 1.0)
@@ -314,7 +361,11 @@ def main() -> None:
                     opt.step()
                 opt.zero_grad(set_to_none=True)
 
-                ema = loss_item if ema is None else (ema_beta * ema + (1 - ema_beta) * loss_item)
+                ema = (
+                    loss_item
+                    if ema is None
+                    else (ema_beta * ema + (1 - ema_beta) * loss_item)
+                )
                 opt_step += 1
 
                 if opt_step % 250 == 0:
@@ -347,7 +398,11 @@ def main() -> None:
                     model.train()
 
             avg_loss = total_loss / max(1, total_count)
-            pbar.set_postfix(loss=float(avg_loss), ema=(float(ema) if ema else None), lr=float(scheduler_last_lr))
+            pbar.set_postfix(
+                loss=float(avg_loss),
+                ema=(float(ema) if ema else None),
+                lr=float(scheduler_last_lr),
+            )
 
     # Final sample
     model.eval()
@@ -355,12 +410,7 @@ def main() -> None:
         seed = tokenizer.encode("こんにちは")[:WINDOW]
         x = torch.tensor(seed, dtype=torch.long, device=device).unsqueeze(0)
         logits = model(x)
-        if logits.dim() == 3:
-            last_logits = logits[:, -1, :]
-        elif logits.dim() == 2:
-            last_logits = logits
-        else:
-            raise RuntimeError(f"Unexpected logits dim at final sample: {tuple(logits.shape)}")
+        last_logits = _last_logits(logits)
         next_id = int(torch.argmax(last_logits, dim=-1).item())
         print("[final]", tokenizer.decode(seed + [next_id]))
     print("done.")

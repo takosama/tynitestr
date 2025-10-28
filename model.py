@@ -2,7 +2,6 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.utils.checkpoint as cp
-import torch.utils.checkpoint as cp
 
 from config import D_MODEL, N_HEAD, N_LAYER
 
@@ -15,7 +14,9 @@ try:
             torch.backends.cuda.enable_mem_efficient_sdp(True)
         elif hasattr(torch.backends.cuda, "sdp_kernel"):
             # PyTorch <=2.1 style context; set global defaults
-            torch.backends.cuda.sdp_kernel(enable_flash=True, enable_mem_efficient=True, enable_math=False)
+            torch.backends.cuda.sdp_kernel(
+                enable_flash=True, enable_mem_efficient=True, enable_math=False
+            )
         # Allow TF32 where beneficial
         if hasattr(torch, "set_float32_matmul_precision"):
             torch.set_float32_matmul_precision("high")
@@ -28,6 +29,7 @@ class CausalSelfAttention(nn.Module):
     """Causal self-attention with single qkv projection and optional query chunking.
     Chunking over the time axis reduces peak activation memory while keeping K/V full.
     """
+
     def __init__(self, d_model: int, n_head: int, q_chunk_size_t: int = 0):
         super().__init__()
         assert d_model % n_head == 0, "d_model must be divisible by n_head"
@@ -97,7 +99,9 @@ class RMSNorm(nn.Module):
 
 
 class TransformerBlock(nn.Module):
-    def __init__(self, d_model: int, n_head: int, attn_q_chunk_t: int = 0, mlp_t_chunk: int = 0):
+    def __init__(
+        self, d_model: int, n_head: int, attn_q_chunk_t: int = 0, mlp_t_chunk: int = 0
+    ):
         super().__init__()
         self.ln1 = RMSNorm(d_model)
         self.attn = CausalSelfAttention(d_model, n_head, q_chunk_size_t=attn_q_chunk_t)
@@ -139,7 +143,15 @@ class TinyGPT2(nn.Module):
         attn_q_chunk = max(1, block_size // 2) if block_size >= 32 else 0
         mlp_t_chunk = max(1, block_size // 2) if block_size >= 32 else 0
         self.blocks = nn.ModuleList(
-            [TransformerBlock(d_model, n_head, attn_q_chunk_t=attn_q_chunk, mlp_t_chunk=mlp_t_chunk) for _ in range(n_layer)]
+            [
+                TransformerBlock(
+                    d_model,
+                    n_head,
+                    attn_q_chunk_t=attn_q_chunk,
+                    mlp_t_chunk=mlp_t_chunk,
+                )
+                for _ in range(n_layer)
+            ]
         )
         self.ln_f = nn.LayerNorm(d_model)
         self.lm_head = nn.Linear(d_model, vocab_size, bias=False)
