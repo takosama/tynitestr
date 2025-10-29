@@ -153,7 +153,7 @@ def _make_dataloader() -> DataLoader:
     return DataLoader(
         ds,
         batch_size=BATCH_SIZE,
-        shuffle=False,
+        shuffle=True,
         pin_memory=bool(PIN_MEMORY),
         num_workers=NUM_WORKERS,
         collate_fn=fast_collate_long,
