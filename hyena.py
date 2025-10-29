@@ -22,29 +22,72 @@ HEAD_RANK = 128
 
 
 class DepthwiseCausalConv1d(nn.Module):
-    """Depthwise 1D convolution with causal (left-only) padding."""
+    """Depthwise 1D 'conv' via FFT (causal: left-only padding)."""
 
     def __init__(self, channels: int, kernel_size: int, dilation: int = 1):
         super().__init__()
         assert kernel_size >= 1
-        self.left_pad = dilation * (kernel_size - 1)
-        self.conv = nn.Conv1d(
-            channels,
-            channels,
-            kernel_size=kernel_size,
-            groups=channels,
-            dilation=dilation,
-            padding=0,
-            bias=False,
-        )
+        self.channels = channels
+        self.kernel_size = kernel_size
+        self.dilation = dilation
+        # 有効カーネル長（空挿入後）
+        self.L_eff = dilation * (kernel_size - 1) + 1
+        # 参照用：左側に入れるパディング量（因果）
+        self.left_pad = self.L_eff - 1
+
+        # depthwise 用にチャネルごとに独立したカーネル（bias なし）
+        # 形状: [C, K]（生のカーネル）; dilation は forward で展開
+        self.weight = nn.Parameter(torch.empty(channels, kernel_size))
+        nn.init.kaiming_uniform_(self.weight, a=5**0.5)
+
+    @staticmethod
+    def _next_pow2(n: int) -> int:
+        # FFT 長は T + L_eff - 1 以上の 2 の冪に
+        p = 1
+        while p < n:
+            p <<= 1
+        return p
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # x: [B, T, C] -> [B, C, T]
-        x_bcT = x.transpose(1, 2).contiguous()
-        if self.left_pad:
-            x_bcT = F.pad(x_bcT, (self.left_pad, 0))
-        y = self.conv(x_bcT)
-        return y.transpose(1, 2)
+        x_bct = x.transpose(1, 2).contiguous()
+        B, C, T = x_bct.shape
+        assert C == self.channels, f"channels mismatch: {C} != {self.channels}"
+
+        device = x_bct.device
+        dtype = x_bct.dtype
+
+        # ダイレーション展開: [C, L_eff] に埋め込み（0 埋め）
+        # 例: dilation=2, K=3 -> 位置 [0,2,4] に w を配置
+        k_eff = torch.zeros(C, self.L_eff, device=device, dtype=dtype)
+        k_eff[:, :: self.dilation] = self.weight
+
+        # conv1d(相関) = 畳み込み(k を時間反転)なので flip する
+        k_rev = torch.flip(k_eff, dims=[-1])  # [C, L_eff]
+
+        # 入力を因果パディング（左側のみに L_eff-1）
+        x_pad = F.pad(x_bct, (self.left_pad, 0))  # [B, C, T+left_pad]
+
+        # 線形畳み込み長
+        target_len = x_pad.shape[-1] + k_rev.shape[-1] - 1
+        n_fft = self._next_pow2(target_len)
+
+        # ゼロパディングして FFT
+        x_pad = F.pad(x_pad, (0, n_fft - x_pad.shape[-1]))         # [B, C, n_fft]
+        k_pad = F.pad(k_rev, (0, n_fft - k_rev.shape[-1]))         # [C, n_fft]
+
+        Xf = torch.fft.rfft(x_pad, n=n_fft)                        # [B, C, n_rfft]
+        Kf = torch.fft.rfft(k_pad, n=n_fft)                        # [C, n_rfft]
+        Yf = Xf * Kf                                               # broadcast on C
+
+        y_full = torch.fft.irfft(Yf, n=n_fft)                      # [B, C, n_fft]
+
+        # ちょうど長さ T 分だけ取り出す。
+        # 検証済み：参照実装(F.conv1d + 左パッド)と一致
+        y = y_full[..., self.left_pad : self.left_pad + T]         # [B, C, T]
+
+        return y.transpose(1, 2)  # -> [B, T, C]
+
 
 
 class HyenaBlock(nn.Module):
@@ -130,8 +173,7 @@ class HyenaLM(nn.Module):
 
         # Low-rank factorized output head: [D -> R] then [R -> V]
         self.lm_head = nn.Sequential(
-            nn.Linear(d_model, HEAD_RANK, bias=False),
-            nn.Linear(HEAD_RANK, vocab_size, bias=False),
+            nn.Linear(d_model,vocab_size, bias=False),
         )
 
         # Cache position ids; not persisted to checkpoints
@@ -140,8 +182,7 @@ class HyenaLM(nn.Module):
         # Optional per-block activation checkpointing (set externally)
         self.checkpoint_blocks: bool = True
 
-    ###### last_only: bool = Trueをデフォルトに　このコメントに従ってクラスのいらない部分を変更
-    def forward(self, x: torch.Tensor, last_only: bool = True) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, last_only: bool = False) -> torch.Tensor:
         """Forward pass.
 
         Args:

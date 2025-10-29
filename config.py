@@ -21,9 +21,9 @@ MODEL_SIZE = "small"
 # Tokenization / data
 VOCAB_SIZE = 30000
 
-WINDOW = 1024
+WINDOW = 64
 CSV_TEXT_COL, CSV_SEP = "text", ","
-BATCH_SIZE, EPOCHS, LR = 512, 8, 1e-4
+BATCH_SIZE, EPOCHS, LR = 128, 8, 1e-4
 BETAS, WEIGHT_DECAY = (0.9, 0.99), 1e-2
 ACCUM_STEPS = 1
 # DataLoader workers: tune per machine

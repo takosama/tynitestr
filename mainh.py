@@ -69,7 +69,6 @@ from tokenizer import ByteBPETokenizer, load_corpus_text, train_bpe_from_text
 # Best-effort: relax Dynamo error handling if imported
 try:
     import torch._dynamo as _dynamo  # type: ignore
-
     _dynamo.config.suppress_errors = True  # swallow internal graph breaks
 except Exception:
     pass
@@ -85,15 +84,48 @@ def _file_sha256(p: Path) -> str:
 def _ce_last_light(
     logits_last: torch.Tensor, targets_last: torch.Tensor, label_smoothing: float = 0.0
 ) -> torch.Tensor:
-    """Memory-friendly CE on the final time step only."""
-    lse = torch.logsumexp(logits_last, dim=-1)
-    z_t = logits_last.gather(1, targets_last.unsqueeze(1)).squeeze(1)
+    """
+    最終トークンのみの軽量CE。logits_last: [B, V], targets_last: [B]
+    """
+    lse = torch.logsumexp(logits_last, dim=-1)           # [B]
+    z_t = logits_last.gather(1, targets_last.unsqueeze(1)).squeeze(1)  # [B]
     if label_smoothing and label_smoothing > 0.0:
-        mean_z = logits_last.mean(dim=-1)
+        mean_z = logits_last.mean(dim=-1)                # [B]
         nll = lse - ((1.0 - label_smoothing) * z_t + label_smoothing * mean_z)
     else:
         nll = lse - z_t
     return nll.mean()
+
+
+# 追加: 全トークン版の軽量CE
+def _ce_all_light(
+    logits: torch.Tensor, targets: torch.Tensor, label_smoothing: float = 0.0
+) -> torch.Tensor:
+    """
+    Robust CE over all time steps if logits are [B, T, V].
+    Falls back to last-token CE if logits are [B, V].
+    targets must be [B, T] when logits are 3D.
+    """
+    if logits.dim() == 3:
+        B, T, V = logits.shape
+        l = logits.view(B * T, V)
+        y = targets.reshape(B * T)
+
+        lse = torch.logsumexp(l, dim=-1)
+        z_t = l.gather(1, y.unsqueeze(1)).squeeze(1)
+        if label_smoothing and label_smoothing > 0.0:
+            mean_z = l.mean(dim=-1)
+            nll = lse - ((1.0 - label_smoothing) * z_t + label_smoothing * mean_z)
+        else:
+            nll = lse - z_t
+        return nll.mean()
+
+    if logits.dim() == 2:
+        # フォールバック: 2D なら最後トークンだけ（互換確保）
+        last_targets = targets[:, -1] if targets.dim() == 2 else targets
+        return _ce_last_light(logits, last_targets, label_smoothing)
+
+    raise RuntimeError(f"Unexpected logits dim: {tuple(logits.shape)}")
 
 
 def _last_logits(logits: torch.Tensor) -> torch.Tensor:
@@ -107,7 +139,6 @@ def _last_logits(logits: torch.Tensor) -> torch.Tensor:
 
 def seed_worker(_wid: int):
     import numpy as _np
-
     s = torch.initial_seed() % (2**32)
     _np.random.seed(s)
 
@@ -230,7 +261,7 @@ def main() -> None:
     print("[sanity] TOK_BIN max id =", mx_seen)
     assert (
         mx_seen < vocab_size
-    ), f"memmap token id {mx_seen} >= vocab_size {vocab_size} 窶・tokenizer/memmap mismatch"
+    ), f"memmap token id {mx_seen} >= vocab_size {vocab_size} ・tokenizer/memmap mismatch"
 
     scaler: Optional[torch.cuda.amp.GradScaler]
     scaler = torch.cuda.amp.GradScaler(enabled=(device.type == "cuda"))
@@ -249,7 +280,7 @@ def main() -> None:
     best_metric = best_metric or float("inf")
 
     n_params = sum(p.numel() for p in model.parameters())
-    print(f"Model ready 窶・vocab={vocab_size} params={n_params:,}")
+    print(f"Model ready ・vocab={vocab_size} params={n_params:,}")
 
     # LR schedule
     total_steps_est = max(1, len(dl)) * max(1, EPOCHS)
@@ -262,9 +293,8 @@ def main() -> None:
     # Train loop
     opt_step = global_step
     ema: Optional[float] = None
-    ### START_TODO: 鬮倬溷喧MAX
-    model=torch.compile(model, mode=HYENA_COMPILE_MODE)
-    #END_TODO
+
+    # ====== ここから学習 ======
     model.train()
     for ep in range(start_epoch, EPOCHS + 1):
         total_loss = 0.0
@@ -274,70 +304,18 @@ def main() -> None:
 
         is_dp = isinstance(model, nn.DataParallel)
         for it, (xb, yb) in enumerate(pbar):
-            if is_dp:
-                # Let DataParallel scatter from CPU
-                xb = xb.long()
-                yb = yb.long()
-            else:
-                xb = xb.long().to(device, non_blocking=True)
-                yb = yb.long().to(device, non_blocking=True)
-
-            if opt_step < 8:
-                xm, xM = int(xb.min()), int(xb.max())
-                ym, yM = int(yb.min()), int(yb.max())
-                assert 0 <= xm and xM < vocab_size, f"x in [{xm},{xM}] OOB"
-                assert 0 <= ym and yM < vocab_size, f"y in [{ym},{yM}] OOB"
-
+            xb = xb.long().to(device, non_blocking=True)
+            yb = yb.long().to(device, non_blocking=True)
             scale = lr_schedule(opt_step)
             base_lr = LR * scale
             for g in opt.param_groups:
                 g["lr"] = base_lr
             scheduler_last_lr = base_lr
+            with torch.cuda.amp.autocast(dtype=torch.bfloat16):
+                logits = model(xb, last_only=  False)
+                loss = _ce_all_light(logits, yb, label_smoothing=LABEL_SMOOTH) / ACCUM_STEPS
 
-            # Forward + last-token loss (robust to 2D/3D logits)
-            if scaler.is_enabled():
-                bf16_ok = bool(
-                    getattr(torch.cuda, "is_bf16_supported", lambda: False)()
-                )
-                cm = (
-                    torch.cuda.amp.autocast(dtype=torch.bfloat16)
-                    if bf16_ok
-                    else torch.cuda.amp.autocast()
-                )
-                with cm:
-                    logits = model(xb, last_only=True)
-                    last_logits = _last_logits(logits)
-                    last_targets = yb[:, -1]
-                    if last_targets.device != last_logits.device:
-                        last_targets = last_targets.to(
-                            last_logits.device, non_blocking=True
-                        )
-                    loss = (
-                        _ce_last_light(
-                            last_logits, last_targets, label_smoothing=LABEL_SMOOTH
-                        )
-                        / ACCUM_STEPS
-                    )
-            else:
-                logits = model(xb, last_only=True)
-                last_logits = _last_logits(logits)
-                last_targets = yb[:, -1]
-                if last_targets.device != last_logits.device:
-                    last_targets = last_targets.to(
-                        last_logits.device, non_blocking=True
-                    )
-                loss = (
-                    _ce_last_light(
-                        last_logits, last_targets, label_smoothing=LABEL_SMOOTH
-                    )
-                    / ACCUM_STEPS
-                )
-
-            if scaler.is_enabled():
-                scaler.scale(loss).backward()
-            else:
-                loss.backward()
-            del logits
+            scaler.scale(loss).backward()
 
             with torch.no_grad():
                 loss_item = float(loss.item() * ACCUM_STEPS)
@@ -382,7 +360,7 @@ def main() -> None:
                     model.eval()
                     with torch.inference_mode():
                         sample = generate_text(
-                            getattr(model, "module", model),  # 笘・unwrap
+                            getattr(model, "module", model),  # unwrap
                             tokenizer,
                             seed_text="こんにちは",
                             max_new_tokens=60,
@@ -410,7 +388,7 @@ def main() -> None:
     with torch.no_grad():
         seed = tokenizer.encode("縺薙ｓ縺ｫ縺｡縺ｯ")[:WINDOW]
         x = torch.tensor(seed, dtype=torch.long, device=device).unsqueeze(0)
-        logits = model(x)
+        logits = getattr(model, "module", model)(x, last_only=True)  # 明示: 末尾だけ
         last_logits = _last_logits(logits)
         next_id = int(torch.argmax(last_logits, dim=-1).item())
         print("[final]", tokenizer.decode(seed + [next_id]))
