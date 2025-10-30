@@ -81,20 +81,6 @@ def _file_sha256(p: Path) -> str:
         return "na"
 
 
-def _ce_last_light(
-    logits_last: torch.Tensor, targets_last: torch.Tensor, label_smoothing: float = 0.0
-) -> torch.Tensor:
-    """
-    最終トークンのみの軽量CE。logits_last: [B, V], targets_last: [B]
-    """
-    lse = torch.logsumexp(logits_last, dim=-1)           # [B]
-    z_t = logits_last.gather(1, targets_last.unsqueeze(1)).squeeze(1)  # [B]
-    if label_smoothing and label_smoothing > 0.0:
-        mean_z = logits_last.mean(dim=-1)                # [B]
-        nll = lse - ((1.0 - label_smoothing) * z_t + label_smoothing * mean_z)
-    else:
-        nll = lse - z_t
-    return nll.mean()
 
 
 # 追加: 全トークン版の軽量CE
@@ -123,8 +109,16 @@ def _ce_all_light(
     if logits.dim() == 2:
         # フォールバック: 2D なら最後トークンだけ（互換確保）
         last_targets = targets[:, -1] if targets.dim() == 2 else targets
-        return _ce_last_light(logits, last_targets, label_smoothing)
 
+        lse = torch.logsumexp(logits, dim=-1)           # [B]
+        z_t = logits.gather(1, last_targets.unsqueeze(1)).squeeze(1)  # [B]
+        if label_smoothing and label_smoothing > 0.0:
+            mean_z = logits.mean(dim=-1)                # [B]
+            nll = lse - ((1.0 - label_smoothing) * z_t + label_smoothing * mean_z)
+        else:
+            nll = lse - z_t
+        return nll.mean()
+    
     raise RuntimeError(f"Unexpected logits dim: {tuple(logits.shape)}")
 
 
@@ -293,7 +287,7 @@ def main() -> None:
     # Train loop
     opt_step = global_step
     ema: Optional[float] = None
-
+    model=torch.compile(model,mode=HYENA_COMPILE_MODE)
     # ====== ここから学習 ======
     model.train()
     for ep in range(start_epoch, EPOCHS + 1):
@@ -386,7 +380,7 @@ def main() -> None:
     # Final sample
     model.eval()
     with torch.no_grad():
-        seed = tokenizer.encode("縺薙ｓ縺ｫ縺｡縺ｯ")[:WINDOW]
+        seed = tokenizer.encode("こんにちは")[:WINDOW]
         x = torch.tensor(seed, dtype=torch.long, device=device).unsqueeze(0)
         logits = getattr(model, "module", model)(x, last_only=True)  # 明示: 末尾だけ
         last_logits = _last_logits(logits)

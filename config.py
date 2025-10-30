@@ -16,14 +16,14 @@ TOKENIZER_JSON = Path("../tokenizer.json")
 FORCE_RETRAIN_TOKENIZER = False
 
 # Model size preset: "small" or "large"
-MODEL_SIZE = "small"
+MODEL_SIZE = "large"
 
 # Tokenization / data
 VOCAB_SIZE = 30000
 
 WINDOW = 64
 CSV_TEXT_COL, CSV_SEP = "text", ","
-BATCH_SIZE, EPOCHS, LR = 128, 8, 1e-4
+BATCH_SIZE, EPOCHS, LR =128, 8, 3e-4
 BETAS, WEIGHT_DECAY = (0.9, 0.99), 1e-2
 ACCUM_STEPS = 1
 # DataLoader workers: tune per machine
@@ -51,10 +51,10 @@ OFF_BIN = Path("../corpus_offsets.u64")  # u64 cumulative document offsets
 LABEL_SMOOTH = 0.03
 WARMUP_STEPS = 100
 EMA_BETA = 0.98
-GRAD_CLIP_NORM = 1.0
+GRAD_CLIP_NORM = 1
 
 # Checkpoint/preview cadence
-HYENA_SAVE_EVERY = 250  # optimizer steps (Hyena-specific)
+HYENA_SAVE_EVERY = 50  # optimizer steps (Hyena-specific)
 PREVIEW_EVERY = 10      # steps between preview generation
 
 # torch.compile settings
