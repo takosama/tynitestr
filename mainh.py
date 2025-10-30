@@ -82,7 +82,6 @@ def _file_sha256(p: Path) -> str:
 
 
 
-
 # 追加: 全トークン版の軽量CE
 def _ce_all_light(
     logits: torch.Tensor, targets: torch.Tensor, label_smoothing: float = 0.0
@@ -357,6 +356,16 @@ def main() -> None:
                             getattr(model, "module", model),  # unwrap
                             tokenizer,
                             seed_text="こんにちは",
+                            max_new_tokens=60,
+                            temperature=0.8,
+                            top_k=60,
+                            top_p=0.9,
+                        )
+                        print("[preview]", sample[:240].replace("\n", " "))
+                        sample = generate_text(
+                            getattr(model, "module", model),  # unwrap
+                            tokenizer,
+                            seed_text="ニャオハ行きます",
                             max_new_tokens=60,
                             temperature=0.8,
                             top_k=60,
