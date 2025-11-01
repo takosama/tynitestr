@@ -96,6 +96,9 @@ def build_memmap_tokens(
     ext = corpus_path.suffix.lower()
     total = 0
     offsets = [0]
+    eos_id = tokenizer.special.get("<eos>")
+    if eos_id is None:
+        raise KeyError("Tokenizer is missing required <eos> special token")
 
     with open(tok_bin, "wb") as f_out:
         if ext in [".csv", ".tsv"]:
@@ -109,7 +112,9 @@ def build_memmap_tokens(
             ):
                 for s in chunk[col].dropna():
                     s = unicodedata.normalize("NFKC", str(s))
-                    ids = tokenizer.encode(s) + [tokenizer.special["<eos>"]]
+                    ids = tokenizer.encode(s)
+                    if not ids or ids[-1] != eos_id:
+                        ids.append(eos_id)
                     arr = np.asarray(ids, dtype=np.uint32)
                     f_out.write(arr.tobytes())
                     total += arr.size
@@ -118,7 +123,9 @@ def build_memmap_tokens(
             text = unicodedata.normalize(
                 "NFKC", corpus_path.read_text(encoding="utf-8")
             )
-            ids = tokenizer.encode(text) + [tokenizer.special["<eos>"]]
+            ids = tokenizer.encode(text)
+            if not ids or ids[-1] != eos_id:
+                ids.append(eos_id)
             arr = np.asarray(ids, dtype=np.uint32)
             f_out.write(arr.tobytes())
             total += arr.size

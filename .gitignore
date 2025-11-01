@@ -27,3 +27,15 @@ __pycache__/Tynigptkarahyena.cpython-313.pyc
 __pycache__/checkpoint.cpython-313.pyc
 __pycache__/checkpoint.cpython-313.pyc
 __pycache__/checkpoint.cpython-313.pyc
+data2.csv
+coupus/coupus_clean.csv
+coupus.csv
+datasets/cache.pt
+coupus/csv_chunks_n_offset.txt
+coupus/csv_chunks_n.txt
+coupus/csv_single_line.txt
+datasets/shuffled.txt
+coupus/csv_chunks_n_offset.txt
+coupus/csv_chunks_n.txt
+coupus/csv_single_line.txt
+datasets/shuffled.txt
