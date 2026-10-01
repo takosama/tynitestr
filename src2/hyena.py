@@ -147,6 +147,9 @@ class HyenaLM(nn.Module):
         kernel_size: int = 17,
     ):
         super().__init__()
+        self.model_config = dict(architecture="HyenaLM", vocab_size=vocab_size,
+                                 d_model=d_model, n_layer=n_layer, block_size=block_size,
+                                 dropout=dropout, kernel_size=kernel_size)
         self.wte = nn.Embedding(vocab_size, d_model)
         # ty with generate.py
         self.wpe = nn.Embedding(block_size, d_model)

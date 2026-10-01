@@ -47,8 +47,8 @@ _force_utf8_console()
 
 # ===== 設定 =====
 DEBUG = False
-CKPT = r"checkpoints_tyny\20251021_175651_latest_000002000.model.pt"
-TOKENIZER_JSON = r"tokenizer.json"
+CKPT = None  # Set to a versioned state-dict bundle, or select latest checkpoint.
+from config import TOKENIZER_JSON
 
 BEAM_SIZE = 16
 FIRST_STEP_TOPK = 120
@@ -159,12 +159,24 @@ def _prob_bar(p: float) -> str:
 
 
 # ===== モデルロード =====
-def _load_model_and_tokenizer():
-    model = torch.load(CKPT, map_location="cuda", weights_only=False)
-    model.to("cuda").eval()
+def _load_model_and_tokenizer(checkpoint_path=None, tokenizer_path=None, device=None):
+    from pathlib import Path
+    from config import CKPT_DIR
+    from model_io import load_model_bundle
     from tokenizer import ByteBPETokenizer
 
-    tok = ByteBPETokenizer(TOKENIZER_JSON)
+    path = checkpoint_path or CKPT
+    if path is None:
+        candidates = sorted(CKPT_DIR.glob("*_latest_*.pt"))
+        if not candidates:
+            raise FileNotFoundError("No versioned checkpoint found; export a tensor checkpoint first")
+        path = candidates[-1]
+    tokenizer_path = Path(tokenizer_path or TOKENIZER_JSON)
+    tok = ByteBPETokenizer(tokenizer_path)
+    device = device or ("cuda" if torch.cuda.is_available() else "cpu")
+    model = load_model_bundle(path, device=device, tokenizer_path=tokenizer_path)
+    if max(tok.vocab.values()) >= model.wte.num_embeddings:
+        raise ValueError("Tokenizer ids exceed model vocabulary")
     return model, tok
 
 
@@ -185,7 +197,7 @@ def prob_span_candidates(
 
     def _enc(txt: str):
         ids = tokenizer.encode(txt or "")
-        return ids if ids else tokenizer.encode(" ")
+        return ids if ids else (tokenizer.encode(" ") or [tokenizer.bos_id])
 
     seed_ids = _enc(seed_text)
     seed = torch.tensor(seed_ids, dtype=torch.long, device=device)[None, :]
@@ -205,7 +217,8 @@ def prob_span_candidates(
             x = torch.cat(
                 [seed, torch.tensor([b.ids], dtype=torch.long, device=device)], dim=1
             )
-            logits = model(x)[:, -1, :] / TEMPERATURE
+            x = x[:, -model.wpe.num_embeddings:]
+            logits = model(x, last_only=True) / TEMPERATURE
             probs = torch.softmax(logits, dim=-1)
             k = min(FIRST_STEP_TOPK if step == 0 else STEP_TOPK, probs.size(-1))
             pv, pi = torch.topk(probs, k=k, dim=-1)
