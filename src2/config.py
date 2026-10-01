@@ -1,4 +1,4 @@
-﻿# ====== Basic Settings ======
+# ====== Basic Settings ======
 import os
 from datetime import datetime
 from pathlib import Path
@@ -12,7 +12,8 @@ os.environ.setdefault(
 )
 
 CORPUS = Path(r"E:\test2\data.csv")  # Adjust to your dataset
-TOKENIZER_JSON = Path("../tokenizer.json")
+ROOT_DIR = Path(__file__).resolve().parents[1]
+TOKENIZER_JSON = ROOT_DIR / "tokenizer.json"
 FORCE_RETRAIN_TOKENIZER = False
 
 # Model size preset: "small" or "large"
@@ -35,15 +36,14 @@ PIN_MEMORY = True
 GRAD_CHECKPOINT = True
 
 # ====== Checkpoint settings ======
-CKPT_DIR = Path("../checkpoints")
-CKPT_DIR.mkdir(exist_ok=True)
+CKPT_DIR = ROOT_DIR / "checkpoints"
 RUN_ID = datetime.now().strftime("%Y%m%d_%H%M%S")
 SAVE_EVERY = 5000  # Save every N optimizer steps
 KEEP_LAST = 3  # How many latest snapshots to keep
 BEST_METRIC = "loss_ema"  # Metric name for best snapshot
 # ====== Memmap layout ======
-TOK_BIN = Path("../corpus_tokens.u32")  # uint32 concatenated token stream
-OFF_BIN = Path("../corpus_offsets.u64")  # u64 cumulative document offsets
+TOK_BIN = ROOT_DIR / "corpus_tokens.u32"  # uint32 concatenated token stream
+OFF_BIN = ROOT_DIR / "corpus_offsets.u64"  # u64 cumulative document offsets
 
 
 # ====== Hyena trainer knobs (moved from mainh.py) ======

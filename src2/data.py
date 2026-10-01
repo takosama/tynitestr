@@ -87,8 +87,16 @@ def build_memmap_tokens(
     off_bin=OFF_BIN,
     chunksize=100_000,
 ):
-    if tok_bin.exists() and off_bin.exists():
-        print("✅ memmap already exists — skipping build")
+    import json
+    manifest_path = Path(str(tok_bin) + ".meta.json")
+    expected = {"tokenizer_sha256": tokenizer.fingerprint,
+                "encoding_version": tokenizer.encoding_version}
+    if tok_bin.exists() or off_bin.exists():
+        if not (tok_bin.exists() and off_bin.exists() and manifest_path.exists()):
+            raise ValueError("Legacy/incomplete memmap: back up existing files and rebuild with matching tokenizer")
+        if json.loads(manifest_path.read_text()) != expected:
+            raise ValueError("Memmap tokenizer mismatch: back up existing files and rebuild")
+        print("✅ matching memmap already exists — skipping build")
         return
     print("🚧 Building memmap tokens (streaming)…")
 
@@ -132,6 +140,7 @@ def build_memmap_tokens(
             offsets.append(total)
 
     np.asarray(offsets, dtype=np.uint64).tofile(off_bin)
+    manifest_path.write_text(json.dumps(expected), encoding="utf-8")
     print(f"✅ memmap built: tokens={total:,} docs={len(offsets)-1}")
 
 

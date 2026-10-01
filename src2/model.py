@@ -136,6 +136,9 @@ class TinyGPT2(nn.Module):
         dropout: float = 0.0,
     ):
         super().__init__()
+        self.model_config = dict(architecture="TinyGPT2", vocab_size=vocab_size,
+                                 d_model=d_model, n_layer=n_layer, block_size=block_size,
+                                 dropout=dropout, n_head=n_head)
         self.wte = nn.Embedding(vocab_size, d_model)
         self.wpe = nn.Embedding(block_size, d_model)
         self.drop = nn.Dropout(dropout)
@@ -160,7 +163,7 @@ class TinyGPT2(nn.Module):
         # Enable per-block activation checkpointing by default for lower peak memory
         self.checkpoint_blocks: bool = True
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, last_only: bool = False) -> torch.Tensor:
         # x: [B, T] (int64 token ids)
         B, T = x.size()
         pos = self._pos_ids[:T].to(x.device)
@@ -172,4 +175,6 @@ class TinyGPT2(nn.Module):
             for blk in self.blocks:
                 h = blk(h)
         h = self.ln_f(h)
+        if last_only:
+            return self.lm_head(h[:, -1, :])  # [B, V]
         return self.lm_head(h)  # [B, T, vocab]

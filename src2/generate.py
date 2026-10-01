@@ -1,4 +1,6 @@
-﻿"""Text generation utilities."""
+"""Text generation utilities."""
+
+import warnings
 
 import torch
 import torch.nn.functional as F
@@ -75,13 +77,9 @@ def generate_text(
             x_in = x[:, -max_pos:]
         else:
             x_in = x
-        logits = model(x_in, last_only=True)  # [1, T, V]
-        if logits.size(1) == 0:
-            # Double-safety; typically this never happens
-            x = torch.cat(
-                [x, torch.tensor([[_fallback_bos(tokenizer)]], device=device)], dim=1
-            )
-            continue
+        logits = model(x_in, last_only=True)  # [B, V]
+        if logits.ndim != 2 or logits.shape[0] != x_in.shape[0] or logits.shape[1] == 0:
+            raise ValueError("last_only=True must return nonempty [B,V] logits")
         # Sample next token
         if temperature <= 0:
             next_id = torch.argmax(logits, dim=-1)
@@ -93,3 +91,17 @@ def generate_text(
         x = torch.cat([x, next_id[:, None]], dim=1)
 
     return tokenizer.decode(x[0].tolist())
+
+
+def preview_text(model, tokenizer, **kwargs):
+    """A failed preview must not interrupt training or leave dropout disabled."""
+    was_training = model.training
+    try:
+        model.eval()
+        with torch.inference_mode():
+            return generate_text(model, tokenizer, **kwargs)
+    except Exception as exc:
+        warnings.warn(f"Preview skipped: {exc}", RuntimeWarning, stacklevel=2)
+        return None
+    finally:
+        model.train(was_training)

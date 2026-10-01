@@ -1,4 +1,4 @@
-﻿"""
+"""
 Windows-friendly HyenaLM trainer with CPU DataLoader and GPU model.
 
 - CPU DataLoader (optional pinned memory)
@@ -56,7 +56,7 @@ from config import (
 )
 from data import build_memmap_tokens, preprocess_corpus
 from data_fast import FastMemmapNexTokDataset, fast_collate_long
-from generate import generate_text
+from generate import preview_text
 from hyena import HyenaLM
 from lora import (
     _apply_lora_to_model,
@@ -75,50 +75,7 @@ except Exception:
 
 
 def _file_sha256(p: Path) -> str:
-    try:
-        return sha256(p.read_bytes()).hexdigest()[:16]
-    except Exception:
-        return "na"
-
-
-
-# 追加: 全トークン版の軽量CE
-def _ce_all_light(
-    logits: torch.Tensor, targets: torch.Tensor, label_smoothing: float = 0.0
-) -> torch.Tensor:
-    """
-    Robust CE over all time steps if logits are [B, T, V].
-    Falls back to last-token CE if logits are [B, V].
-    targets must be [B, T] when logits are 3D.
-    """
-    if logits.dim() == 3:
-        B, T, V = logits.shape
-        l = logits.view(B * T, V)
-        y = targets.reshape(B * T)
-
-        lse = torch.logsumexp(l, dim=-1)
-        z_t = l.gather(1, y.unsqueeze(1)).squeeze(1)
-        if label_smoothing and label_smoothing > 0.0:
-            mean_z = l.mean(dim=-1)
-            nll = lse - ((1.0 - label_smoothing) * z_t + label_smoothing * mean_z)
-        else:
-            nll = lse - z_t
-        return nll.mean()
-
-    if logits.dim() == 2:
-        # フォールバック: 2D なら最後トークンだけ（互換確保）
-        last_targets = targets[:, -1] if targets.dim() == 2 else targets
-
-        lse = torch.logsumexp(logits, dim=-1)           # [B]
-        z_t = logits.gather(1, last_targets.unsqueeze(1)).squeeze(1)  # [B]
-        if label_smoothing and label_smoothing > 0.0:
-            mean_z = logits.mean(dim=-1)                # [B]
-            nll = lse - ((1.0 - label_smoothing) * z_t + label_smoothing * mean_z)
-        else:
-            nll = lse - z_t
-        return nll.mean()
-    
-    raise RuntimeError(f"Unexpected logits dim: {tuple(logits.shape)}")
+    return sha256(p.read_bytes()).hexdigest()
 
 
 def _last_logits(logits: torch.Tensor) -> torch.Tensor:
@@ -269,7 +226,7 @@ def main() -> None:
         "best_metric": None,
     }
 
-    global_step, start_epoch, best_metric = try_resume(model, opt, scaler)
+    global_step, start_epoch, best_metric = try_resume(model, opt, scaler, tokenizer_sha256=tokenizer_hash)
     best_metric = best_metric or float("inf")
 
     n_params = sum(p.numel() for p in model.parameters())
@@ -283,108 +240,100 @@ def main() -> None:
         t = (step - WARMUP_STEPS) / max(1, (total_steps_est - WARMUP_STEPS))
         return 0.1 + 0.9 * 0.5 * (1 + math.cos(math.pi * min(1.0, t)))
 
+    if start_epoch > EPOCHS:
+        print("No remaining epochs; checkpoint is already complete.")
+        return
+
     # Train loop
     opt_step = global_step
     ema: Optional[float] = None
     model=torch.compile(model,mode=HYENA_COMPILE_MODE)
     # ====== ここから学習 ======
     model.train()
-    for ep in range(start_epoch, EPOCHS + 1):
-        total_loss = 0.0
-        total_count = 0
-        pbar = tqdm(dl, desc=f"Epoch {ep}/{EPOCHS}", leave=False)
-        opt.zero_grad(set_to_none=True)
+    ep = start_epoch
+    meta["epoch_complete"] = False
+    try:
+        for ep in range(start_epoch, EPOCHS + 1):
+            total_loss = 0.0
+            total_count = 0
+            pbar = tqdm(dl, desc=f"Epoch {ep}/{EPOCHS}", leave=False)
+            opt.zero_grad(set_to_none=True)
 
-        is_dp = isinstance(model, nn.DataParallel)
-        for it, (xb, yb) in enumerate(pbar):
-            xb = xb.long().to(device, non_blocking=True)
-            yb = yb.long().to(device, non_blocking=True)
-            scale = lr_schedule(opt_step)
-            base_lr = LR * scale
-            for g in opt.param_groups:
-                g["lr"] = base_lr
-            scheduler_last_lr = base_lr
-            with torch.cuda.amp.autocast(dtype=torch.bfloat16):
-                logits = model(xb, last_only=  False)
-                loss = _ce_all_light(logits, yb, label_smoothing=LABEL_SMOOTH) / ACCUM_STEPS
+            is_dp = isinstance(model, nn.DataParallel)
+            for it, (xb, yb) in enumerate(pbar):
+                xb = xb.long().to(device, non_blocking=True)
+                yb = yb.long().to(device, non_blocking=True)
+                scale = lr_schedule(opt_step)
+                base_lr = LR * scale
+                for g in opt.param_groups:
+                    g["lr"] = base_lr
+                scheduler_last_lr = base_lr
+                with torch.cuda.amp.autocast(dtype=torch.bfloat16):
+                    logits = model(xb, last_only=  False)
+                    loss = _ce_all_light(logits, yb, label_smoothing=LABEL_SMOOTH) / ACCUM_STEPS
 
-            scaler.scale(loss).backward()
+                scaler.scale(loss).backward()
 
-            with torch.no_grad():
-                loss_item = float(loss.item() * ACCUM_STEPS)
-                bs = xb.size(0)
-                total_loss += loss_item * bs
-                total_count += bs
+                with torch.no_grad():
+                    loss_item = float(loss.item() * ACCUM_STEPS)
+                    bs = xb.size(0)
+                    total_loss += loss_item * bs
+                    total_count += bs
 
-            do_step = (it + 1) % ACCUM_STEPS == 0
-            if do_step:
-                params = (
-                    p
-                    for p in model.parameters()
-                    if p.requires_grad and p.grad is not None
-                )
-                if scaler.is_enabled():
-                    scaler.unscale_(opt)
-                torch.nn.utils.clip_grad_norm_(params, GRAD_CLIP_NORM)
-                if scaler.is_enabled():
-                    scaler.step(opt)
-                    scaler.update()
-                else:
-                    opt.step()
-                opt.zero_grad(set_to_none=True)
+                do_step = (it + 1) % ACCUM_STEPS == 0
+                if do_step:
+                    params = (
+                        p
+                        for p in model.parameters()
+                        if p.requires_grad and p.grad is not None
+                    )
+                    if scaler.is_enabled():
+                        scaler.unscale_(opt)
+                    torch.nn.utils.clip_grad_norm_(params, GRAD_CLIP_NORM)
+                    if scaler.is_enabled():
+                        scaler.step(opt)
+                        scaler.update()
+                    else:
+                        opt.step()
+                    opt.zero_grad(set_to_none=True)
 
-                ema = (
-                    loss_item
-                    if ema is None
-                    else (EMA_BETA * ema + (1 - EMA_BETA) * loss_item)
-                )
-                opt_step += 1
+                    ema = (
+                        loss_item
+                        if ema is None
+                        else (EMA_BETA * ema + (1 - EMA_BETA) * loss_item)
+                    )
+                    opt_step += 1
 
-                if opt_step % HYENA_SAVE_EVERY == 0:
-                    meta["best_metric"] = best_metric
-                    save_checkpoint("latest", model, opt, scaler, opt_step, ep, meta)
-                    if ema < best_metric:
-                        best_metric = ema
+                    if opt_step % HYENA_SAVE_EVERY == 0:
                         meta["best_metric"] = best_metric
-                        save_checkpoint("best", model, opt, scaler, opt_step, ep, meta)
-                        print(f"\n[best] ema={best_metric:.4f} @ step {opt_step}")
+                        save_checkpoint("latest", model, opt, scaler, opt_step, ep, meta)
+                        if ema < best_metric:
+                            best_metric = ema
+                            meta["best_metric"] = best_metric
+                            save_checkpoint("best", model, opt, scaler, opt_step, ep, meta)
+                            print(f"\n[best] ema={best_metric:.4f} @ step {opt_step}")
 
-                if opt_step % PREVIEW_EVERY == 0:
-                    model.eval()
-                    with torch.inference_mode():
-                        sample = generate_text(
-                            getattr(model, "module", model),  # unwrap
-                            tokenizer,
-                            seed_text="こんにちは",
-                            max_new_tokens=60,
-                            temperature=0.8,
-                            top_k=60,
-                            top_p=0.9,
-                        )
-                        print("[preview]", sample[:240].replace("\n", " "))
-                        sample = generate_text(
-                            getattr(model, "module", model),  # unwrap
-                            tokenizer,
-                            seed_text="ニャオハ行きます",
-                            max_new_tokens=60,
-                            temperature=0.8,
-                            top_k=60,
-                            top_p=0.9,
-                        )
-                        print("[preview]", sample[:240].replace("\n", " "))
-                if device.type == "cuda":
-                    try:
-                        torch.cuda.empty_cache()
-                    except Exception:
-                        pass
-                model.train()
+                    if opt_step % PREVIEW_EVERY == 0:
+                        for prompt in ("こんにちは", "ニャオハ行きます"):
+                            sample = preview_text(
+                                model, tokenizer, seed_text=prompt, max_new_tokens=60,
+                                temperature=0.8, top_k=60, top_p=0.9,
+                            )
+                            if sample is not None:
+                                print("[preview]", sample[:240].replace("\n", " "))
 
-            avg_loss = total_loss / max(1, total_count)
-            pbar.set_postfix(
-                loss=float(avg_loss),
-                ema=(float(ema) if ema else None),
-                lr=float(scheduler_last_lr),
-            )
+                avg_loss = total_loss / max(1, total_count)
+                pbar.set_postfix(
+                    loss=float(avg_loss),
+                    ema=(float(ema) if ema else None),
+                    lr=float(scheduler_last_lr),
+                )
+    except KeyboardInterrupt:
+        save_checkpoint("latest", model, opt, scaler, opt_step, ep, meta)
+        raise
+    else:
+        meta["epoch_complete"] = True
+        save_checkpoint("latest", model, opt, scaler, opt_step, ep, meta)
 
     # Final sample
     model.eval()

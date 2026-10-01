@@ -44,7 +44,7 @@ from config import (
 )
 from data import build_memmap_tokens, preprocess_corpus
 from data_fast import FastMemmapNexTokDataset, fast_collate_long
-from generate import generate_text
+from generate import preview_text
 from lora import (
     _apply_lora_to_model,
     _collect_lora_params,
@@ -56,10 +56,7 @@ from tokenizer import ByteBPETokenizer, load_corpus_text, train_bpe_from_text
 
 
 def _file_sha256(p: Path) -> str:
-    try:
-        return sha256(p.read_bytes()).hexdigest()[:16]
-    except Exception:
-        return "na"
+    return sha256(p.read_bytes()).hexdigest()
 
 
 def _ce_last_light(
@@ -198,7 +195,7 @@ def main() -> None:
         "best_metric": None,
     }
 
-    global_step, start_epoch, best_metric = try_resume(model, opt, scaler)
+    global_step, start_epoch, best_metric = try_resume(model, opt, scaler, tokenizer_sha256=tokenizer_hash)
     best_metric = best_metric or float("inf")
 
     n_params = sum(p.numel() for p in model.parameters())
@@ -214,6 +211,10 @@ def main() -> None:
         t = (step - WARMUP_STEPS) / max(1, (total_steps_est - WARMUP_STEPS))
         return 0.1 + 0.9 * 0.5 * (1 + math.cos(math.pi * min(1.0, t)))
 
+    if start_epoch > EPOCHS:
+        print("No remaining epochs; checkpoint is already complete.")
+        return
+
     # Train loop
     PREVIEW_INTERVAL = 200
     opt_step = global_step
@@ -221,36 +222,53 @@ def main() -> None:
     ema_beta = 0.98
 
     model.train()
-    for ep in range(start_epoch, EPOCHS + 1):
-        total_loss = 0.0
-        total_count = 0
-        pbar = tqdm(dl, desc=f"Epoch {ep}/{EPOCHS}", leave=False)
-        opt.zero_grad(set_to_none=True)
+    ep = start_epoch
+    meta["epoch_complete"] = False
+    try:
+        for ep in range(start_epoch, EPOCHS + 1):
+            total_loss = 0.0
+            total_count = 0
+            pbar = tqdm(dl, desc=f"Epoch {ep}/{EPOCHS}", leave=False)
+            opt.zero_grad(set_to_none=True)
 
-        is_dp = isinstance(model, nn.DataParallel)
-        for it, (xb, yb) in enumerate(pbar):
-            if is_dp:
-                xb = xb.long()
-                yb = yb.long()
-            else:
-                xb = xb.long().to(device, non_blocking=True)
-                yb = yb.long().to(device, non_blocking=True)
+            is_dp = isinstance(model, nn.DataParallel)
+            for it, (xb, yb) in enumerate(pbar):
+                if is_dp:
+                    xb = xb.long()
+                    yb = yb.long()
+                else:
+                    xb = xb.long().to(device, non_blocking=True)
+                    yb = yb.long().to(device, non_blocking=True)
 
-            if opt_step < 8:
-                xm, xM = int(xb.min()), int(xb.max())
-                ym, yM = int(yb.min()), int(yb.max())
-                assert 0 <= xm and xM < vocab_size, f"x in [{xm},{xM}] OOB"
-                assert 0 <= ym and yM < vocab_size, f"y in [{ym},{yM}] OOB"
+                if opt_step < 8:
+                    xm, xM = int(xb.min()), int(xb.max())
+                    ym, yM = int(yb.min()), int(yb.max())
+                    assert 0 <= xm and xM < vocab_size, f"x in [{xm},{xM}] OOB"
+                    assert 0 <= ym and yM < vocab_size, f"y in [{ym},{yM}] OOB"
 
-            scale = lr_schedule(opt_step)
-            base_lr = LR * scale
-            for g in opt.param_groups:
-                g["lr"] = base_lr
-            scheduler_last_lr = base_lr
+                scale = lr_schedule(opt_step)
+                base_lr = LR * scale
+                for g in opt.param_groups:
+                    g["lr"] = base_lr
+                scheduler_last_lr = base_lr
 
-            # Forward + last-token loss
-            if scaler.is_enabled():
-                with torch.cuda.amp.autocast(True):
+                # Forward + last-token loss
+                if scaler.is_enabled():
+                    with torch.cuda.amp.autocast(True):
+                        logits = model(xb)
+                        last_logits = logits[:, -1, :]
+                        last_targets = yb[:, -1]
+                        if last_targets.device != last_logits.device:
+                            last_targets = last_targets.to(
+                                last_logits.device, non_blocking=True
+                            )
+                        loss = (
+                            _ce_last_light(
+                                last_logits, last_targets, label_smoothing=LABEL_SMOOTH
+                            )
+                            / ACCUM_STEPS
+                        )
+                else:
                     logits = model(xb)
                     last_logits = logits[:, -1, :]
                     last_targets = yb[:, -1]
@@ -264,92 +282,72 @@ def main() -> None:
                         )
                         / ACCUM_STEPS
                     )
-            else:
-                logits = model(xb)
-                last_logits = logits[:, -1, :]
-                last_targets = yb[:, -1]
-                if last_targets.device != last_logits.device:
-                    last_targets = last_targets.to(
-                        last_logits.device, non_blocking=True
-                    )
-                loss = (
-                    _ce_last_light(
-                        last_logits, last_targets, label_smoothing=LABEL_SMOOTH
-                    )
-                    / ACCUM_STEPS
-                )
 
-            if scaler.is_enabled():
-                scaler.scale(loss).backward()
-            else:
-                loss.backward()
-            del logits
-
-            with torch.no_grad():
-                loss_item = float(loss.item() * ACCUM_STEPS)
-                bs = xb.size(0)
-                total_loss += loss_item * bs
-                total_count += bs
-
-            do_step = (it + 1) % ACCUM_STEPS == 0
-            if do_step:
-                params = (
-                    p
-                    for p in model.parameters()
-                    if p.requires_grad and p.grad is not None
-                )
                 if scaler.is_enabled():
-                    scaler.unscale_(opt)
-                torch.nn.utils.clip_grad_norm_(params, 1.0)
-                if scaler.is_enabled():
-                    scaler.step(opt)
-                    scaler.update()
+                    scaler.scale(loss).backward()
                 else:
-                    opt.step()
-                opt.zero_grad(set_to_none=True)
+                    loss.backward()
+                del logits
 
-                ema = (
-                    loss_item
-                    if ema is None
-                    else (ema_beta * ema + (1 - ema_beta) * loss_item)
-                )
-                opt_step += 1
+                with torch.no_grad():
+                    loss_item = float(loss.item() * ACCUM_STEPS)
+                    bs = xb.size(0)
+                    total_loss += loss_item * bs
+                    total_count += bs
 
-                if opt_step % 1000 == 0:
-                    meta["best_metric"] = best_metric
-                    save_checkpoint("latest", model, opt, scaler, opt_step, ep, meta)
-                    if ema < best_metric:
-                        best_metric = ema
+                do_step = (it + 1) % ACCUM_STEPS == 0
+                if do_step:
+                    params = (
+                        p
+                        for p in model.parameters()
+                        if p.requires_grad and p.grad is not None
+                    )
+                    if scaler.is_enabled():
+                        scaler.unscale_(opt)
+                    torch.nn.utils.clip_grad_norm_(params, 1.0)
+                    if scaler.is_enabled():
+                        scaler.step(opt)
+                        scaler.update()
+                    else:
+                        opt.step()
+                    opt.zero_grad(set_to_none=True)
+
+                    ema = (
+                        loss_item
+                        if ema is None
+                        else (ema_beta * ema + (1 - ema_beta) * loss_item)
+                    )
+                    opt_step += 1
+
+                    if opt_step % 1000 == 0:
                         meta["best_metric"] = best_metric
-                        save_checkpoint("best", model, opt, scaler, opt_step, ep, meta)
-                        print(f"\n[best] ema={best_metric:.4f} @ step {opt_step}")
+                        save_checkpoint("latest", model, opt, scaler, opt_step, ep, meta)
+                        if ema < best_metric:
+                            best_metric = ema
+                            meta["best_metric"] = best_metric
+                            save_checkpoint("best", model, opt, scaler, opt_step, ep, meta)
+                            print(f"\n[best] ema={best_metric:.4f} @ step {opt_step}")
 
-                if opt_step % PREVIEW_INTERVAL == 0:
-                    model.eval()
-                    with torch.inference_mode():
-                        sample = generate_text(
-                            model,
-                            tokenizer,
-                            seed_text="こんにちは",
-                            max_new_tokens=60,
-                            temperature=0.8,
-                            top_k=60,
-                            top_p=0.9,
+                    if opt_step % PREVIEW_INTERVAL == 0:
+                        sample = preview_text(
+                            model, tokenizer, seed_text="こんにちは", max_new_tokens=60,
+                            temperature=0.8, top_k=60, top_p=0.9,
                         )
-                    print("[preview]", sample[:240].replace("\n", " "))
-                    if device.type == "cuda":
-                        try:
-                            torch.cuda.empty_cache()
-                        except Exception:
-                            pass
-                    model.train()
+                        if sample is not None:
+                            print("[preview]", sample[:240].replace("\n", " "))
 
-            avg_loss = total_loss / max(1, total_count)
-            pbar.set_postfix(
-                loss=float(avg_loss),
-                ema=(float(ema) if ema else None),
-                lr=float(scheduler_last_lr),
-            )
+                avg_loss = total_loss / max(1, total_count)
+                pbar.set_postfix(
+                    loss=float(avg_loss),
+                    ema=(float(ema) if ema else None),
+                    lr=float(scheduler_last_lr),
+                )
+    except KeyboardInterrupt:
+        save_checkpoint("latest", model, opt, scaler, opt_step, ep, meta)
+        raise
+    else:
+        meta["epoch_complete"] = True
+        save_checkpoint("latest", model, opt, scaler, opt_step, ep, meta)
 
     # Final sample
     model.eval()
